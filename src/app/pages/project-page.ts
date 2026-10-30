@@ -14,7 +14,8 @@ import { Router, RouterLink } from '@angular/router';
 import { firstValueFrom } from 'rxjs';
 import {
   DEFAULT_SETTINGS,
-  estimateRunSeconds,
+  calibratedStageSeconds,
+  sumSeconds,
   estimatedGlbBytes,
   estimatedStlBytes,
   recommendedFaces,
@@ -261,7 +262,12 @@ const PREVIEW_LIMIT = 48;
         <section aria-labelledby="runs-heading" class="runs">
           <h2 id="runs-heading">Runs</h2>
           @for (j of jobs.value(); track j.id) {
-            <app-job-card [job]="j" [initiallyExpanded]="$first" (changed)="jobs.reload()" />
+            <app-job-card
+              [job]="j"
+              [initiallyExpanded]="$first"
+              [calibration]="calibration.value()"
+              (changed)="jobs.reload()"
+            />
           } @empty {
             <p class="muted">No runs yet.</p>
           }
@@ -459,9 +465,19 @@ export class ProjectPage {
   protected readonly calibration = this.api.calibration();
   protected readonly estimate = computed(() => {
     if (!this.imageTotal()) return '—';
-    const secs =
-      estimateRunSeconds(this.imageTotal(), this.photoCount(), this.videoCount(), this.settings()) *
-      (this.calibration.value()?.factor ?? 1);
+    const s = this.settings();
+    const secs = sumSeconds(
+      calibratedStageSeconds(
+        {
+          images: this.imageTotal(),
+          photos: this.photoCount(),
+          videos: this.videoCount(),
+          quality: s.quality,
+          targetFaces: s.targetFaces,
+        },
+        this.calibration.value(),
+      ),
+    );
     return '~' + formatDuration(secs * 1000);
   });
 

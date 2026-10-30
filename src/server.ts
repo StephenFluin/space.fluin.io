@@ -7,6 +7,7 @@ import {
 import express from 'express';
 import { join } from 'node:path';
 import { createApi } from './server/api';
+import { pipeline } from './server/pipeline';
 
 const browserDistFolder = join(import.meta.dirname, '../browser');
 
@@ -51,6 +52,8 @@ if (isMainModule(import.meta.url) || process.env['pm_id']) {
     }
 
     console.log(`Node Express server listening on http://localhost:${port}`);
+    // Resume interrupted or queued runs straight away rather than on the first request.
+    pipeline.enqueue();
   });
 }
 

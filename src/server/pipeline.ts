@@ -19,6 +19,7 @@ import {
   useSequentialMatching,
   type JobOutput,
   type JobSettings,
+  type EstimateInput,
   type JobStats,
   type OutputKind,
   type StageName,
@@ -115,7 +116,8 @@ class Pipeline {
     // Claim atomically so two servers sharing the database never run the same job.
     const claimed = db
       .prepare(
-        `UPDATE jobs SET status = 'running', worker_pid = ?, started_at = datetime('now'), progress = 0
+        `UPDATE jobs SET status = 'running', worker_pid = ?, attempts = attempts + 1,
+           started_at = COALESCE(started_at, datetime('now'))
          WHERE id = ? AND status = 'queued'`,
       )
       .run(process.pid, next.id);
@@ -148,6 +150,11 @@ class Pipeline {
     }
   }
 
+  /**
+   * Runs the steps in order. A run resumed after a server restart skips steps that already
+   * finished, and the step that was interrupted continues from COLMAP's files on disk where it can
+   * (feature extraction, matching and dense stereo skip work that already exists).
+   */
   private async process(job: JobRow): Promise<JobOutput[]> {
     const db = getDb();
     const settings = JSON.parse(job.settings) as JobSettings;
@@ -161,6 +168,32 @@ class Pipeline {
     await mkdir(dir, { recursive: true });
     const log = createWriteStream(join(dir, 'job.log'), { flags: 'a' });
 
+    const timings = JSON.parse(job.stages || '[]') as StageTiming[];
+    const stats = JSON.parse(job.stats || '{}') as JobStats;
+    const finished = new Set(
+      timings.filter((t) => t.finishedAt && !t.interrupted).map((t) => t.name),
+    );
+    if (timings.length)
+      log.write(`\n=== Resuming after restart (attempt ${job.attempts + 1}) ===\n`);
+
+    const saveTimings = () =>
+      db.prepare(`UPDATE jobs SET stages = ? WHERE id = ?`).run(JSON.stringify(timings), job.id);
+    const addStats = (more: JobStats) => {
+      Object.assign(stats, more);
+      db.prepare(`UPDATE jobs SET stats = ? WHERE id = ?`).run(JSON.stringify(stats), job.id);
+    };
+    const estimateInputs = (): EstimateInput => ({
+      images: stats.images ?? 0,
+      photos: stats.photos ?? 0,
+      videos: stats.videos ?? 0,
+      quality: settings.quality,
+      targetFaces: settings.targetFaces,
+      denseSources: DENSE_SOURCES[settings.quality],
+    });
+    const recordSample = db.prepare(
+      `INSERT INTO stage_samples (job_id, stage, seconds, inputs) VALUES (?, ?, ?, ?)`,
+    );
+
     const stageStart = (name: StageName) => {
       let start = 0;
       for (const st of STAGES) {
@@ -169,35 +202,7 @@ class Pipeline {
       }
       return start;
     };
-    const timings: StageTiming[] = [];
-    const saveTimings = () =>
-      db.prepare(`UPDATE jobs SET stages = ? WHERE id = ?`).run(JSON.stringify(timings), job.id);
-    const closeStage = () => {
-      const last = timings.at(-1);
-      if (last && !last.finishedAt) last.finishedAt = new Date().toISOString();
-    };
-    const stats: JobStats = {};
-    const addStats = (more: JobStats) => {
-      Object.assign(stats, more);
-      db.prepare(`UPDATE jobs SET stats = ? WHERE id = ?`).run(JSON.stringify(stats), job.id);
-    };
-
     let current: { name: StageName; start: number; weight: number } | null = null;
-    const setStage = (name: StageName) => {
-      if (this.running?.cancelled) throw new Cancelled();
-      const weight = STAGES.find((st) => st.name === name)!.weight;
-      current = { name, start: stageStart(name), weight };
-      stageFraction = 0;
-      closeStage();
-      timings.push({ name, startedAt: new Date().toISOString(), finishedAt: null });
-      saveTimings();
-      log.write(`\n=== ${name} ===\n`);
-      db.prepare(`UPDATE jobs SET stage = ?, progress = ? WHERE id = ?`).run(
-        name,
-        current.start,
-        job.id,
-      );
-    };
     let stageFraction = 0;
     const setFraction = (f: number) => {
       // Tools print assorted "n / m" counters; never let the bar move backwards within a step.
@@ -209,6 +214,44 @@ class Pipeline {
         job.id,
       );
     };
+
+    /** Runs one step unless an earlier attempt finished it, recording its duration. */
+    const step = async (name: StageName, run: (resumed: boolean) => Promise<void>) => {
+      if (finished.has(name)) {
+        log.write(`\n=== ${name}: already done ===\n`);
+        return;
+      }
+      if (this.running?.cancelled) throw new Cancelled();
+      const resumed = timings.some((t) => t.name === name);
+      const weight = STAGES.find((st) => st.name === name)!.weight;
+      current = { name, start: stageStart(name), weight };
+      stageFraction = 0;
+      const timing: StageTiming = { name, startedAt: new Date().toISOString(), finishedAt: null };
+      timings.push(timing);
+      saveTimings();
+      log.write(`\n=== ${name}${resumed ? ' (resumed)' : ''} ===\n`);
+      db.prepare(`UPDATE jobs SET stage = ?, progress = ? WHERE id = ?`).run(
+        name,
+        current.start,
+        job.id,
+      );
+      try {
+        await run(resumed);
+      } catch (err) {
+        timing.finishedAt = new Date().toISOString();
+        timing.interrupted = true;
+        saveTimings();
+        throw err;
+      }
+      timing.finishedAt = new Date().toISOString();
+      saveTimings();
+      // A resumed step only redid part of the work, so its time would skew the estimates.
+      if (!resumed) {
+        const seconds = (Date.parse(timing.finishedAt) - Date.parse(timing.startedAt)) / 1000;
+        recordSample.run(job.id, name, seconds, JSON.stringify(estimateInputs()));
+      }
+    };
+
     const exec = (
       cmd: Command,
       args: string[],
@@ -224,270 +267,281 @@ class Pipeline {
             ? setFraction
             : undefined,
       );
-    /** For tools that loop over the images several times, restarting their "i / n" counter each pass. */
-    const multiPass = (passes: number) => {
-      let pass = 0;
-      let last = 0;
-      return (f: number) => {
-        if (f < last - 0.5) pass++;
-        last = f;
-        setFraction((Math.min(pass, passes - 1) + f) / passes);
-      };
-    };
+
+    const imagesDir = join(dir, 'images');
+    const photos = media.filter((m) => m.type === 'image');
+    const videos = media.filter((m) => m.type === 'video');
+    const db_ = join(dir, 'database.db');
+    const sparseDir = join(dir, 'sparse');
+    const alignedDir = join(dir, 'sparse-aligned');
+    const denseDir = join(dir, 'dense');
+    const fused = join(denseDir, 'fused.ply');
+    const rawMesh = join(dir, 'mesh.ply');
+    const outDir = join(dir, 'output');
+    const size = String(DENSE_SIZE[settings.quality]);
+    /** The aligned model if alignment succeeded, else the largest sparse model. */
+    const model = async () =>
+      existsSync(join(alignedDir, 'images.bin')) ? alignedDir : await largestModel(sparseDir);
 
     try {
       // 1. Gather inputs: link photos (keeping EXIF for focal length priors) and sample video frames.
-      setStage('Preparing images');
-      const imagesDir = join(dir, 'images');
-      await rm(imagesDir, { recursive: true, force: true });
-      const photosDir = join(imagesDir, 'photos');
-      await mkdir(photosDir, { recursive: true });
-      const photos = media.filter((m) => m.type === 'image');
-      const videos = media.filter((m) => m.type === 'video');
-      for (const m of photos) {
-        const from = join(mediaDir(job.project_id), m.filename);
-        const to = join(photosDir, m.filename);
-        await link(from, to).catch(() => copyFile(from, to));
-      }
-      const ffmpeg: Command = { bin: ffmpegBin(), args: [] };
-      for (const [i, v] of videos.entries()) {
-        // One folder per video so COLMAP gives each clip its own camera intrinsics.
-        const out = join(imagesDir, `video-${v.id}`);
-        await mkdir(out, { recursive: true });
-        await exec(ffmpeg, [
-          '-hide_banner',
-          '-loglevel',
-          'error',
-          '-i',
-          join(mediaDir(job.project_id), v.filename),
-          '-vf',
-          `fps=${settings.videoFps},scale='min(3840,iw)':-2`,
-          '-qscale:v',
-          '2',
-          join(out, 'frame-%05d.jpg'),
-        ]);
-        setFraction((i + 1) / videos.length);
-      }
-      if (photos.length === 0) await rm(photosDir, { recursive: true });
-      const imageCount = await countFiles(imagesDir);
-      log.write(`${imageCount} images (${photos.length} photos, ${videos.length} videos)\n`);
-      addStats({
-        images: imageCount,
-        photos: photos.length,
-        videos: videos.length,
-        videoFrames: imageCount - photos.length,
+      await step('Preparing images', async () => {
+        await rm(imagesDir, { recursive: true, force: true });
+        const photosDir = join(imagesDir, 'photos');
+        await mkdir(photosDir, { recursive: true });
+        for (const m of photos) {
+          const from = join(mediaDir(job.project_id), m.filename);
+          const to = join(photosDir, m.filename);
+          await link(from, to).catch(() => copyFile(from, to));
+        }
+        const ffmpeg: Command = { bin: ffmpegBin(), args: [] };
+        for (const [i, v] of videos.entries()) {
+          // One folder per video so COLMAP gives each clip its own camera intrinsics.
+          const out = join(imagesDir, `video-${v.id}`);
+          await mkdir(out, { recursive: true });
+          await exec(ffmpeg, [
+            '-hide_banner',
+            '-loglevel',
+            'error',
+            '-i',
+            join(mediaDir(job.project_id), v.filename),
+            '-vf',
+            `fps=${settings.videoFps},scale='min(3840,iw)':-2`,
+            '-qscale:v',
+            '2',
+            join(out, 'frame-%05d.jpg'),
+          ]);
+          setFraction((i + 1) / videos.length);
+        }
+        if (photos.length === 0) await rm(photosDir, { recursive: true });
+        const imageCount = await countFiles(imagesDir);
+        log.write(`${imageCount} images (${photos.length} photos, ${videos.length} videos)\n`);
+        addStats({
+          images: imageCount,
+          photos: photos.length,
+          videos: videos.length,
+          videoFrames: imageCount - photos.length,
+        });
+        if (imageCount < 3) throw new Error('Need at least 3 images (or a video) to reconstruct');
       });
-      if (imageCount < 3) throw new Error('Need at least 3 images (or a video) to reconstruct');
+      const imageCount = stats.images ?? (await countFiles(imagesDir));
 
       const colmap = await colmapCommand(dir, jobContainerName(job.id));
       await removeContainer(jobContainerName(job.id));
       if (!colmap) throw new Error('COLMAP is not available. See the system status panel.');
       const cpu = await this.cpuFlags(colmap);
       addStats({ gpu: colmap.gpu, denseSources: DENSE_SOURCES[settings.quality] });
-      if (!colmap.gpu)
+      if (!colmap.gpu) {
         log.write('No GPU available to COLMAP: extracting and matching features on the CPU\n');
-      const db_ = join(dir, 'database.db');
-      await rm(db_, { force: true });
+      }
 
-      // 2. Features + matching. Sequential matching suits video-heavy captures and large sets.
-      setStage('Extracting features');
-      await exec(
-        colmap,
-        [
-          'feature_extractor',
-          '--database_path',
-          db_,
-          '--image_path',
-          imagesDir,
-          '--ImageReader.single_camera_per_folder',
-          '1',
-          ...cpu.extract,
-        ],
-        { progress: true },
-      );
+      // 2. Features + matching. Both skip images/pairs already in the database when resumed.
+      await step('Extracting features', async (resumed) => {
+        if (!resumed) await rm(db_, { force: true });
+        await exec(
+          colmap,
+          [
+            'feature_extractor',
+            '--database_path',
+            db_,
+            '--image_path',
+            imagesDir,
+            '--ImageReader.single_camera_per_folder',
+            '1',
+            ...cpu.extract,
+          ],
+          { progress: true },
+        );
+      });
 
-      setStage('Matching features');
-      const sequential = useSequentialMatching(imageCount, photos.length, videos.length);
-      await exec(
-        colmap,
-        [
-          sequential ? 'sequential_matcher' : 'exhaustive_matcher',
-          '--database_path',
-          db_,
-          ...cpu.match,
-        ],
-        {
-          progress: true,
-        },
-      );
+      await step('Matching features', async () => {
+        // Sequential matching suits video-heavy captures and large sets.
+        const sequential = useSequentialMatching(imageCount, photos.length, videos.length);
+        await exec(
+          colmap,
+          [
+            sequential ? 'sequential_matcher' : 'exhaustive_matcher',
+            '--database_path',
+            db_,
+            ...cpu.match,
+          ],
+          { progress: true },
+        );
+      });
 
       // 3. Structure from motion.
-      setStage('Sparse reconstruction');
-      const sparseDir = join(dir, 'sparse');
-      await rm(sparseDir, { recursive: true, force: true });
-      await mkdir(sparseDir, { recursive: true });
-      await exec(
-        colmap,
-        ['mapper', '--database_path', db_, '--image_path', imagesDir, '--output_path', sparseDir],
-        {
-          progress: true,
-        },
-      );
-      let model = await largestModel(sparseDir);
-      if (!model)
-        throw new Error(
-          'Sparse reconstruction failed: no images could be registered. Add more overlap.',
+      await step('Sparse reconstruction', async () => {
+        await rm(sparseDir, { recursive: true, force: true });
+        await mkdir(sparseDir, { recursive: true });
+        await exec(
+          colmap,
+          ['mapper', '--database_path', db_, '--image_path', imagesDir, '--output_path', sparseDir],
+          { progress: true },
         );
-
-      addStats(await this.analyzeModel(colmap, model));
+        const sparse = await largestModel(sparseDir);
+        if (!sparse) {
+          throw new Error(
+            'Sparse reconstruction failed: no images could be registered. Add more overlap.',
+          );
+        }
+        addStats(await this.analyzeModel(colmap, sparse));
+      });
 
       // 4. Gravity alignment so models come out upright. Best effort: unaligned models still mesh fine.
-      setStage('Aligning orientation');
-      const alignedDir = join(dir, 'sparse-aligned');
-      await mkdir(alignedDir, { recursive: true });
-      try {
+      await step('Aligning orientation', async () => {
+        await rm(alignedDir, { recursive: true, force: true });
+        await mkdir(alignedDir, { recursive: true });
+        try {
+          await exec(colmap, [
+            'model_orientation_aligner',
+            '--image_path',
+            imagesDir,
+            '--input_path',
+            (await largestModel(sparseDir))!,
+            '--output_path',
+            alignedDir,
+            '--max_image_size',
+            '1024',
+          ]);
+        } catch (err) {
+          if (err instanceof Cancelled) throw err;
+          await rm(alignedDir, { recursive: true, force: true });
+          log.write('Orientation alignment failed; continuing with unaligned model\n');
+        }
+      });
+
+      // 5. Multi-view stereo (CUDA).
+      await step('Undistorting images', async () => {
+        await rm(denseDir, { recursive: true, force: true });
         await exec(colmap, [
-          'model_orientation_aligner',
+          'image_undistorter',
           '--image_path',
           imagesDir,
           '--input_path',
-          model,
+          (await model())!,
           '--output_path',
-          alignedDir,
+          denseDir,
+          '--output_type',
+          'COLMAP',
           '--max_image_size',
-          '1024',
-        ]);
-        model = alignedDir;
-      } catch {
-        log.write('Orientation alignment failed; continuing with unaligned model\n');
-      }
-
-      // 5. Multi-view stereo (CUDA).
-      setStage('Undistorting images');
-      const denseDir = join(dir, 'dense');
-      await rm(denseDir, { recursive: true, force: true });
-      const size = String(DENSE_SIZE[settings.quality]);
-      await exec(colmap, [
-        'image_undistorter',
-        '--image_path',
-        imagesDir,
-        '--input_path',
-        model,
-        '--output_path',
-        denseDir,
-        '--output_type',
-        'COLMAP',
-        '--max_image_size',
-        size,
-        '--num_patch_match_src_images',
-        String(DENSE_SOURCES[settings.quality]),
-      ]);
-
-      setStage('Dense stereo');
-      if (!colmap.gpu) {
-        throw new Error(
-          'Sparse model done, but dense stereo needs a CUDA GPU. For Docker, install the NVIDIA Container Toolkit, then start a new run.',
-        );
-      }
-      await exec(
-        colmap,
-        [
-          'patch_match_stereo',
-          '--workspace_path',
-          denseDir,
-          '--workspace_format',
-          'COLMAP',
-          '--PatchMatchStereo.geom_consistency',
-          'true',
-          '--PatchMatchStereo.max_image_size',
           size,
-        ],
-        // geom_consistency runs a photometric pass, then a geometric pass, over every view.
-        { progress: multiPass(2) },
-      );
+          '--num_patch_match_src_images',
+          String(DENSE_SOURCES[settings.quality]),
+        ]);
+      });
 
-      setStage('Fusing point cloud');
-      const fused = join(denseDir, 'fused.ply');
-      await exec(
-        colmap,
-        [
-          'stereo_fusion',
-          '--workspace_path',
-          denseDir,
-          '--workspace_format',
-          'COLMAP',
-          '--input_type',
-          'geometric',
-          '--output_path',
-          fused,
-        ],
-        { progress: true },
-      );
+      await step('Dense stereo', async () => {
+        if (!colmap.gpu) {
+          throw new Error(
+            'Sparse model done, but dense stereo needs a CUDA GPU. For Docker, install the NVIDIA Container Toolkit, then start a new run.',
+          );
+        }
+        // COLMAP skips views whose depth maps exist, so a resumed run starts part-way through.
+        const done = await depthMapCounts(denseDir);
+        if (done.total) setFraction((done.photometric + done.geometric) / (2 * done.total));
+        await exec(
+          colmap,
+          [
+            'patch_match_stereo',
+            '--workspace_path',
+            denseDir,
+            '--workspace_format',
+            'COLMAP',
+            '--PatchMatchStereo.geom_consistency',
+            'true',
+            '--PatchMatchStereo.max_image_size',
+            size,
+          ],
+          // A photometric pass, then a geometric pass, over every view.
+          {
+            progress: multiPass(
+              setFraction,
+              2,
+              done.total && done.photometric >= done.total ? 1 : 0,
+            ),
+          },
+        );
+      });
 
-      const densePoints = await plyVertexCount(fused);
-      if (densePoints !== null) addStats({ densePoints });
+      await step('Fusing point cloud', async () => {
+        await exec(
+          colmap,
+          [
+            'stereo_fusion',
+            '--workspace_path',
+            denseDir,
+            '--workspace_format',
+            'COLMAP',
+            '--input_type',
+            'geometric',
+            '--output_path',
+            fused,
+          ],
+          { progress: true },
+        );
+        const densePoints = await plyVertexCount(fused);
+        if (densePoints !== null) addStats({ densePoints });
+      });
 
       // 6. Surface reconstruction. Delaunay copes better with thin walls and textureless interiors.
-      setStage('Meshing');
-      const rawMesh = join(dir, 'mesh.ply');
-      if (settings.mesher === 'delaunay') {
-        await exec(colmap, [
-          'delaunay_mesher',
-          '--input_path',
-          denseDir,
-          '--input_type',
-          'dense',
-          '--output_path',
-          rawMesh,
-        ]);
-      } else {
-        await exec(colmap, [
-          'poisson_mesher',
-          '--input_path',
-          fused,
-          '--output_path',
-          rawMesh,
-          '--PoissonMeshing.trim',
-          project.kind === 'exterior' ? '7' : '5',
-        ]);
-      }
+      await step('Meshing', async () => {
+        if (settings.mesher === 'delaunay') {
+          await exec(colmap, [
+            'delaunay_mesher',
+            '--input_path',
+            denseDir,
+            '--input_type',
+            'dense',
+            '--output_path',
+            rawMesh,
+          ]);
+        } else {
+          await exec(colmap, [
+            'poisson_mesher',
+            '--input_path',
+            fused,
+            '--output_path',
+            rawMesh,
+            '--PoissonMeshing.trim',
+            project.kind === 'exterior' ? '7' : '5',
+          ]);
+        }
+      });
 
       // 7. Blender: clean, orient, scale, and export STL/GLB/.blend.
-      setStage('Post-processing in Blender');
-      const outDir = join(dir, 'output');
-      await mkdir(outDir, { recursive: true });
-      const script = join(dir, 'postprocess.py');
-      await writeFile(script, BLENDER_SCRIPT);
-      await exec({ bin: blenderBin(), args: [] }, [
-        '--background',
-        '--factory-startup',
-        '--python-exit-code',
-        '1',
-        '--python',
-        script,
-        '--',
-        rawMesh,
-        outDir,
-        String(settings.targetFaces),
-        String(settings.printSizeMm),
-        project.kind,
-      ]);
-      await copyFile(rawMesh, join(outDir, 'mesh.ply'));
-      try {
-        const post = JSON.parse(await readFile(join(outDir, 'postprocess.json'), 'utf8'));
-        addStats({
-          meshFaces: post.faces,
-          printableFaces: post.printableFaces,
-          dimensionsMm: post.dimensionsMm,
-        });
-      } catch {
-        // Stats are informational only.
-      }
+      await step('Post-processing in Blender', async () => {
+        await mkdir(outDir, { recursive: true });
+        const script = join(dir, 'postprocess.py');
+        await writeFile(script, BLENDER_SCRIPT);
+        await exec({ bin: blenderBin(), args: [] }, [
+          '--background',
+          '--factory-startup',
+          '--python-exit-code',
+          '1',
+          '--python',
+          script,
+          '--',
+          rawMesh,
+          outDir,
+          String(settings.targetFaces),
+          String(settings.printSizeMm),
+          project.kind,
+        ]);
+        await copyFile(rawMesh, join(outDir, 'mesh.ply'));
+        try {
+          const post = JSON.parse(await readFile(join(outDir, 'postprocess.json'), 'utf8'));
+          addStats({
+            meshFaces: post.faces,
+            printableFaces: post.printableFaces,
+            dimensionsMm: post.dimensionsMm,
+          });
+        } catch {
+          // Stats are informational only.
+        }
+      });
 
       return collectOutputs(outDir);
     } finally {
-      closeStage();
-      saveTimings();
       await new Promise((r) => log.end(r));
     }
   }
@@ -591,6 +645,35 @@ async function plyVertexCount(path: string): Promise<number | null> {
   } catch {
     return null;
   }
+}
+
+/**
+ * For tools that loop over the images several times, restarting their "i / n" counter each pass.
+ * `startPass` lets a resumed run begin in a later pass.
+ */
+function multiPass(setFraction: (f: number) => void, passes: number, startPass = 0) {
+  let pass = startPass;
+  let last = 0;
+  return (f: number) => {
+    if (f < last - 0.5) pass++;
+    last = f;
+    setFraction((Math.min(pass, passes - 1) + f) / passes);
+  };
+}
+
+/** Depth maps already computed in a dense workspace, per pass. */
+async function depthMapCounts(denseDir: string) {
+  const imagesDir = join(denseDir, 'images');
+  const mapsDir = join(denseDir, 'stereo', 'depth_maps');
+  const count = async (dir: string, suffix: string) =>
+    existsSync(dir)
+      ? (await readdir(dir, { recursive: true })).filter((f) => String(f).endsWith(suffix)).length
+      : 0;
+  return {
+    total: await count(imagesDir, ''),
+    photometric: await count(mapsDir, '.photometric.bin'),
+    geometric: await count(mapsDir, '.geometric.bin'),
+  };
 }
 
 async function countFiles(dir: string): Promise<number> {

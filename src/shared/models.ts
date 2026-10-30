@@ -73,6 +73,8 @@ export interface StageTiming {
   /** ISO timestamps. */
   startedAt: string;
   finishedAt: string | null;
+  /** The server stopped during this attempt; the step ran again when the run resumed. */
+  interrupted?: boolean;
 }
 
 /** Facts gathered while a run progresses; every field appears once its step has run. */
@@ -109,6 +111,8 @@ export interface Job {
   outputs: JobOutput[];
   stages: StageTiming[];
   stats: JobStats;
+  /** How many times a worker has started this run; above 1 means it resumed after a restart. */
+  attempts: number;
   error: string | null;
   createdAt: string;
   startedAt: string | null;
@@ -153,31 +157,58 @@ export const DENSE_SOURCES: Record<Quality, number> = { preview: 8, medium: 12, 
 export const useSequentialMatching = (images: number, photos: number, videos: number) =>
   (videos > 0 && photos < images / 2) || images > 400;
 
-/**
- * Rough run time in seconds for an RTX-class GPU before calibration. The server scales it by how
- * long past runs on this machine actually took (see /api/calibration).
- */
-export function estimateRunSeconds(
-  images: number,
-  photos: number,
-  videos: number,
-  s: JobSettings,
-): number {
-  if (images <= 0) return 0;
-  const mp = (DENSE_SIZE[s.quality] / 1000) ** 2;
-  const pairs = useSequentialMatching(images, photos, videos)
-    ? images * 10
-    : (images * (images - 1)) / 2;
-  const features = 0.2 * images;
-  const matching = 0.03 * pairs;
-  const sparse = 0.25 * images * Math.max(1, images / 150);
-  const dense = 0.09 * images * 2 * DENSE_SOURCES[s.quality] * mp;
-  const fusion = 0.05 * images * mp;
-  const meshing = 15 + 0.02 * images * mp;
-  const blender = 20 + (s.targetFaces / 1_000_000) * 60;
-  const overhead = 30; // container start-ups, orientation alignment, undistortion
-  return features + matching + sparse + dense + fusion + meshing + blender + overhead;
+/** What a run's duration depends on. Stored with every timing sample so estimates can be refit. */
+export interface EstimateInput {
+  images: number;
+  photos: number;
+  videos: number;
+  quality: Quality;
+  targetFaces: number;
+  /** Defaults to the current DENSE_SOURCES for the quality. */
+  denseSources?: number;
 }
+
+/**
+ * Baseline seconds per step on an RTX-class GPU. Real timings recorded on this machine correct
+ * each step separately (see Calibration), since e.g. GPU-bound dense stereo and CPU-bound
+ * matching scale very differently between machines.
+ */
+export function estimateStageSeconds(i: EstimateInput): Record<StageName, number> {
+  const n = Math.max(i.images, 0);
+  const side = DENSE_SIZE[i.quality] / 1000;
+  const mp = side ** 2;
+  const sources = i.denseSources ?? DENSE_SOURCES[i.quality];
+  const pairs = useSequentialMatching(n, i.photos, i.videos) ? n * 10 : (n * (n - 1)) / 2;
+  return {
+    'Preparing images': 1 + 0.1 * (n - i.photos),
+    'Extracting features': 5 + 0.1 * n,
+    'Matching features': 5 + 0.02 * pairs,
+    'Sparse reconstruction': 5 + 0.1 * n * Math.max(1, n / 150),
+    'Aligning orientation': 4 + 0.02 * n,
+    'Undistorting images': 2 + 0.02 * n * mp,
+    // Two passes (photometric + geometric) over every view, each matched against `sources` views.
+    // Measured runs grew far slower than pixel count between presets, so scale by image side.
+    'Dense stereo': 0.6 * n * 2 * sources * side,
+    'Fusing point cloud': 2 + 0.05 * n * mp,
+    Meshing: 10 + 0.8 * n * mp,
+    'Post-processing in Blender': 15 + (i.targetFaces / 1_000_000) * 70,
+  };
+}
+
+/** Calibrated seconds per step for this machine. */
+export function calibratedStageSeconds(
+  i: EstimateInput,
+  calibration?: Calibration | null,
+): Record<StageName, number> {
+  const base = estimateStageSeconds(i);
+  for (const name of Object.keys(base) as StageName[]) {
+    base[name] *= calibration?.byQuality[i.quality]?.[name] ?? calibration?.factors[name] ?? 1;
+  }
+  return base;
+}
+
+export const sumSeconds = (stages: Record<StageName, number>) =>
+  Object.values(stages).reduce((a, b) => a + b, 0);
 
 /**
  * Triangles worth keeping for a print: about two per 0.4 mm nozzle-width cell over the model's
@@ -194,8 +225,10 @@ export const estimatedStlBytes = (faces: number) => 84 + faces * 50;
 export const estimatedGlbBytes = (faces: number) => faces * 30;
 
 export interface Calibration {
-  /** Multiply estimateRunSeconds by this for this machine. */
-  factor: number;
-  /** Completed runs the factor is based on. */
+  /** Per step: median of actual ÷ estimated seconds over recent runs on this machine. */
+  factors: Partial<Record<StageName, number>>;
+  /** The same, from runs at one quality preset only; preferred when present. */
+  byQuality: Partial<Record<Quality, Partial<Record<StageName, number>>>>;
+  /** Distinct runs the factors are based on. */
   runs: number;
 }

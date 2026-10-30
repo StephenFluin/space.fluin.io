@@ -6,9 +6,10 @@ import { open, rm, stat, unlink } from 'node:fs/promises';
 import { extname, join } from 'node:path';
 import {
   DEFAULT_SETTINGS,
-  DENSE_SOURCES,
-  estimateRunSeconds,
+  STAGES,
+  estimateStageSeconds,
   type Calibration,
+  type EstimateInput,
   type Job,
   type JobSettings,
   type Media,
@@ -44,6 +45,7 @@ const toJob = (r: JobRow): Job => ({
   outputs: JSON.parse(r.outputs),
   stages: JSON.parse(r.stages ?? '[]'),
   stats: JSON.parse(r.stats ?? '{}'),
+  attempts: r.attempts ?? 0,
   error: r.error,
   createdAt: r.created_at,
   startedAt: r.started_at,
@@ -169,27 +171,45 @@ export function createApi() {
     next();
   });
 
-  /** How much slower or faster than the built-in estimate past runs on this machine were. */
+  /**
+   * Per step, how much slower or faster than the built-in estimate this machine really is: the
+   * median of actual ÷ estimated over the step's 20 most recent recorded timings.
+   */
   api.get('/calibration', (_req, res) => {
-    const rows = getDb()
-      .prepare(`SELECT * FROM jobs WHERE status = 'done' ORDER BY id DESC LIMIT 20`)
-      .all() as unknown as JobRow[];
-    const ratios: number[] = [];
-    for (const job of rows.map(toJob)) {
-      const { images, photos = 0, videos = 0, denseSources } = job.stats;
-      // Only runs whose settings the current model describes.
-      if (!images || !job.stages.length || denseSources !== DENSE_SOURCES[job.settings.quality])
-        continue;
-      const actual = job.stages.reduce(
-        (n, t) => n + (t.finishedAt ? Date.parse(t.finishedAt) - Date.parse(t.startedAt) : 0),
-        0,
-      );
-      const predicted = estimateRunSeconds(images, photos, videos, job.settings) * 1000;
-      if (actual > 0 && predicted > 0) ratios.push(actual / predicted);
+    const db = getDb();
+    const median = (xs: number[]) => {
+      const sorted = xs.filter((r) => Number.isFinite(r) && r > 0).sort((a, b) => a - b);
+      return sorted.length
+        ? Math.min(Math.max(sorted[Math.floor(sorted.length / 2)], 0.05), 50)
+        : null;
+    };
+    const body: Calibration = { factors: {}, byQuality: {}, runs: 0 };
+    const runs = new Set<number>();
+    for (const { name } of STAGES) {
+      const samples = (
+        db
+          .prepare(
+            `SELECT job_id, seconds, inputs FROM stage_samples WHERE stage = ? ORDER BY id DESC LIMIT 50`,
+          )
+          .all(name) as { job_id: number; seconds: number; inputs: string }[]
+      ).map((sm) => {
+        runs.add(sm.job_id);
+        const inputs = JSON.parse(sm.inputs) as EstimateInput;
+        return { quality: inputs.quality, ratio: sm.seconds / estimateStageSeconds(inputs)[name] };
+      });
+      const all = median(samples.slice(0, 20).map((sm) => sm.ratio));
+      if (all !== null) body.factors[name] = all;
+      for (const quality of ['preview', 'medium', 'high'] as const) {
+        const q = median(
+          samples
+            .filter((sm) => sm.quality === quality)
+            .slice(0, 20)
+            .map((sm) => sm.ratio),
+        );
+        if (q !== null) (body.byQuality[quality] ??= {})[name] = q;
+      }
     }
-    ratios.sort((a, b) => a - b);
-    const median = ratios.length ? ratios[Math.floor(ratios.length / 2)] : 1;
-    const body: Calibration = { factor: Math.min(Math.max(median, 0.2), 20), runs: ratios.length };
+    body.runs = runs.size;
     res.json(body);
   });
 

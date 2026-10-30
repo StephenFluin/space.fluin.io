@@ -27,10 +27,18 @@ videos ─┴─ ffmpeg frame sampling ──► features ► matching ► spars
   the row. Only one run executes at a time per server process.
 - **The browser only reads.** Pages poll `/api/projects/:id/jobs` every 2 s, so closing, reloading or
   opening the app on another device never affects a run.
-- **Server restarts:** queued runs are picked up again automatically. A run that was mid-flight is
-  marked failed ("Interrupted by server restart"), and its COLMAP container (named
-  `space-<hash>-job-<id>`) is removed so it stops using the GPU. Start a new run to retry; it starts
-  from the beginning.
+- **Server restarts:** the server picks work up again as soon as it starts. A run that was
+  mid-flight is queued again and **resumes from its last finished step**. The interrupted step
+  continues from COLMAP's files on disk where it can: feature extraction, matching and dense stereo
+  skip images, pairs and depth maps they already have. The old COLMAP container (named
+  `space-<hash>-job-<id>`) is removed first so it doesn't hold the GPU. After 3 interruptions a run
+  is failed instead of retrying forever.
+- **Time estimates:** every completed step is stored in the `stage_samples` table with the inputs it
+  depended on (image count, quality, source views, triangles). It's kept even when a run is deleted.
+  Each step has a built-in cost model, and `/api/calibration` scales it by the median of actual ÷
+  estimated over that step's recent samples, separately per quality preset when it has samples. The
+  pre-run estimate, the live ETA and the per-step expectations all use it, so they improve with
+  every run.
 - **Several servers** (e.g. `ng serve` and a production build) can share one `data/` folder: claims
   are atomic, each run records its worker's pid, and cancel requests reach whichever process owns the run.
 

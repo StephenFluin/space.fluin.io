@@ -10,7 +10,13 @@ import {
 } from '@angular/core';
 import { DatePipe, DecimalPipe } from '@angular/common';
 import { RouterLink } from '@angular/router';
-import { STAGES, type Job, type OutputKind } from '../../shared/models';
+import {
+  STAGES,
+  calibratedStageSeconds,
+  type Calibration,
+  type Job,
+  type OutputKind,
+} from '../../shared/models';
 import { Api, formatBytes, formatDuration, outputUrl, parseTime } from '../api';
 
 const OUTPUT_LABELS: Record<OutputKind, string> = {
@@ -92,6 +98,14 @@ type StepState = 'done' | 'current' | 'failed' | 'pending' | 'skipped';
             }
           </p>
         </div>
+      }
+
+      @if (j.attempts > 1) {
+        <p class="muted resumed">
+          Resumed after
+          {{ j.attempts - 1 === 1 ? 'a server restart' : j.attempts - 1 + ' server restarts' }};
+          finished steps were kept.
+        </p>
       }
 
       @if (j.status === 'failed' && j.error) {
@@ -266,6 +280,7 @@ type StepState = 'done' | 'current' | 'failed' | 'pending' | 'skipped';
       margin: 0;
     }
     .when,
+    .resumed,
     .settings,
     .eta {
       font-size: 0.85rem;
@@ -378,6 +393,8 @@ export class JobCard {
   readonly job = input.required<Job>();
   /** The newest run starts expanded; older runs collapse to a summary. */
   readonly initiallyExpanded = input(false);
+  /** Per-step timing corrections for this machine, for the ETA. */
+  readonly calibration = input<Calibration | undefined>(undefined);
   readonly changed = output<void>();
 
   protected readonly labels = OUTPUT_LABELS;
@@ -421,26 +438,48 @@ export class JobCard {
   );
   protected readonly currentStep = computed(() => Math.max(this.stageIndex(), 0) + 1);
 
+  /** Calibrated expected seconds per step, once the run knows how many images it has. */
+  private readonly expected = computed(() => {
+    const { stats, settings } = this.job();
+    if (!stats.images) return null;
+    return calibratedStageSeconds(
+      {
+        images: stats.images,
+        photos: stats.photos ?? 0,
+        videos: stats.videos ?? 0,
+        quality: settings.quality,
+        targetFaces: settings.targetFaces,
+        denseSources: stats.denseSources,
+      },
+      this.calibration(),
+    );
+  });
+
   protected readonly stepRows = computed(() => {
     const j = this.job();
     const now = this.now();
-    const timings = new Map(j.stages.map((t) => [t.name, t]));
     const idx = this.stageIndex();
+    const expected = this.expected();
     return STAGES.map((s, i) => {
-      const t = timings.get(s.name);
+      // A step interrupted by a restart has several attempts; show their total.
+      const attempts = j.stages.filter((t) => t.name === s.name);
       let state: StepState = 'pending';
-      if (j.status === 'done') state = t || !j.stages.length ? 'done' : 'skipped';
+      if (j.status === 'done') state = attempts.length || !j.stages.length ? 'done' : 'skipped';
       else if (i < idx) state = 'done';
       else if (i === idx && j.status === 'running') state = 'current';
       else if (i === idx && j.status === 'failed') state = 'failed';
-      let time = '';
-      if (t) {
+      let ms = 0;
+      for (const t of attempts) {
         const end = t.finishedAt
           ? parseTime(t.finishedAt).getTime()
           : state === 'current'
             ? now
             : null;
-        if (end !== null) time = formatDuration(end - parseTime(t.startedAt).getTime());
+        if (end !== null) ms += end - parseTime(t.startedAt).getTime();
+      }
+      let time = attempts.length ? formatDuration(ms) : '';
+      if (state === 'pending' && expected && this.active()) {
+        time = `~${formatDuration(expected[s.name] * 1000)}`;
       }
       return { name: s.name, state, time };
     });
@@ -451,28 +490,27 @@ export class JobCard {
   );
 
   /**
-   * Remaining time from the observed speed: the current step's pace once it has made some
-   * progress (stage weights are calibrated to real runs), otherwise the whole run's pace.
+   * Remaining time: the current step from its observed pace once it has made some progress
+   * (else its calibrated estimate), plus calibrated estimates for the steps after it.
    */
   protected readonly eta = computed(() => {
     const j = this.job();
     if (j.status !== 'running' || !j.startedAt) return null;
     const now = this.now();
     const idx = this.stageIndex();
-    if (idx < 0) return null;
+    const expected = this.expected();
+    if (idx < 0 || !expected) return null;
     const before = STAGES.slice(0, idx).reduce((n, s) => n + s.weight, 0);
-    const weight = STAGES[idx].weight;
-    const fraction = (j.progress - before) / weight;
-    const timing = j.stages.find((t) => t.name === j.stage);
+    const fraction = Math.min(Math.max((j.progress - before) / STAGES[idx].weight, 0), 1);
+    const timing = j.stages.filter((t) => t.name === j.stage).at(-1);
     const stageMs = timing ? now - parseTime(timing.startedAt).getTime() : 0;
-    const totalMs = now - parseTime(j.startedAt).getTime();
 
-    let msPerUnit: number | null = null;
-    if (fraction > 0.05 && stageMs > 10_000) msPerUnit = stageMs / (fraction * weight);
-    else if (j.progress > 0.1 && totalMs > 30_000) msPerUnit = totalMs / j.progress;
-    if (msPerUnit === null) return null;
-
-    const remainingMs = msPerUnit * (1 - j.progress);
+    const currentMs =
+      fraction > 0.05 && stageMs > 10_000
+        ? (stageMs * (1 - fraction)) / fraction
+        : Math.max(expected[STAGES[idx].name] * 1000 - stageMs, 0);
+    const laterMs = STAGES.slice(idx + 1).reduce((n, s) => n + expected[s.name] * 1000, 0);
+    const remainingMs = currentMs + laterMs;
     return { remaining: formatDuration(remainingMs), at: new Date(now + remainingMs) };
   });
 

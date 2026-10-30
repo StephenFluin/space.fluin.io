@@ -1,7 +1,14 @@
 import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import type { JobStatus, ProjectKind } from '../shared/models';
+import type {
+  EstimateInput,
+  JobSettings,
+  JobStats,
+  JobStatus,
+  ProjectKind,
+  StageTiming,
+} from '../shared/models';
 
 /** Root folder for the database, uploaded media and reconstruction workspaces. */
 export const DATA_DIR = resolve(process.env['SPACE_DATA_DIR'] ?? 'data');
@@ -11,6 +18,9 @@ const KEY = Symbol.for('space.fluin.io/db');
 const holder = globalThis as unknown as Record<symbol, DatabaseSync | undefined>;
 
 let migrated = false;
+
+/** Server restarts a run may survive before it is failed. */
+const MAX_ATTEMPTS = 3;
 
 /** Adds columns introduced after the first release. Idempotent. */
 function migrate(db: DatabaseSync) {
@@ -31,6 +41,57 @@ function migrate(db: DatabaseSync) {
     (c) => c.name,
   );
   if (!mediaColumns.includes('duration')) db.exec(`ALTER TABLE media ADD COLUMN duration REAL`);
+  if (!jobColumns.includes('attempts')) {
+    db.exec(`ALTER TABLE jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0`);
+  }
+
+  // One row per completed step, kept even when the run is deleted, to calibrate time estimates.
+  const hasSamples = db
+    .prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'stage_samples'`)
+    .get();
+  if (!hasSamples) {
+    db.exec(`
+      CREATE TABLE stage_samples (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        job_id INTEGER NOT NULL,
+        stage TEXT NOT NULL,
+        seconds REAL NOT NULL,
+        inputs TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX stage_samples_stage ON stage_samples (stage, id);
+    `);
+    backfillSamples(db);
+  }
+}
+
+/** Seeds stage_samples from runs finished before samples were recorded. */
+function backfillSamples(db: DatabaseSync) {
+  const jobs = db
+    .prepare(`SELECT id, settings, stats, stages FROM jobs WHERE status = 'done'`)
+    .all() as { id: number; settings: string; stats: string; stages: string }[];
+  const insert = db.prepare(
+    `INSERT INTO stage_samples (job_id, stage, seconds, inputs) VALUES (?, ?, ?, ?)`,
+  );
+  for (const job of jobs) {
+    const stats = JSON.parse(job.stats) as JobStats;
+    const settings = JSON.parse(job.settings) as JobSettings;
+    if (!stats.images) continue;
+    const inputs: EstimateInput = {
+      images: stats.images,
+      photos: stats.photos ?? 0,
+      videos: stats.videos ?? 0,
+      quality: settings.quality,
+      targetFaces: settings.targetFaces,
+      // Runs before this was recorded used COLMAP's default of 20.
+      denseSources: stats.denseSources ?? 20,
+    };
+    for (const t of JSON.parse(job.stages) as StageTiming[]) {
+      if (!t.finishedAt || t.interrupted) continue;
+      const seconds = (Date.parse(t.finishedAt) - Date.parse(t.startedAt)) / 1000;
+      insert.run(job.id, t.name, seconds, JSON.stringify(inputs));
+    }
+  }
 }
 
 /** Opens the database lazily so the build-time route extraction never touches disk. */
@@ -83,17 +144,32 @@ export function getDb(): DatabaseSync {
   migrate(db);
 
   // Several servers (e.g. a dev server and a production build) may share this database, so only
-  // fail running jobs whose worker process is gone. Queued jobs are picked up again.
-  const running = db.prepare(`SELECT id, worker_pid FROM jobs WHERE status = 'running'`).all() as {
-    id: number;
-    worker_pid: number | null;
-  }[];
+  // touch running jobs whose worker process is gone. Those are queued again and resume from their
+  // last finished step; a run that keeps getting interrupted is failed instead of looping forever.
+  const running = db
+    .prepare(`SELECT id, worker_pid, attempts, stages FROM jobs WHERE status = 'running'`)
+    .all() as { id: number; worker_pid: number | null; attempts: number; stages: string }[];
   for (const job of running) {
     if (job.worker_pid && isAlive(job.worker_pid)) continue;
-    db.prepare(
-      `UPDATE jobs SET status = 'failed', error = 'Interrupted by server restart', finished_at = datetime('now')
-       WHERE id = ?`,
-    ).run(job.id);
+    const stages = JSON.parse(job.stages) as StageTiming[];
+    for (const t of stages) {
+      if (!t.finishedAt) {
+        t.finishedAt = new Date().toISOString();
+        t.interrupted = true;
+      }
+    }
+    if (job.attempts >= MAX_ATTEMPTS) {
+      db.prepare(
+        `UPDATE jobs SET status = 'failed', stages = ?, finished_at = datetime('now'),
+           error = 'Interrupted by server restarts ${MAX_ATTEMPTS} times; start a new run'
+         WHERE id = ?`,
+      ).run(JSON.stringify(stages), job.id);
+    } else {
+      db.prepare(
+        `UPDATE jobs SET status = 'queued', worker_pid = NULL, cancel_requested = 0, stages = ?
+         WHERE id = ?`,
+      ).run(JSON.stringify(stages), job.id);
+    }
   }
   return db;
 }
@@ -141,6 +217,7 @@ export interface JobRow {
   cancel_requested: number;
   stages: string;
   stats: string;
+  attempts: number;
   created_at: string;
   started_at: string | null;
   finished_at: string | null;
