@@ -1,11 +1,11 @@
-import { spawn, type ChildProcess } from 'node:child_process';
+import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import { createWriteStream, existsSync, type WriteStream } from 'node:fs';
 import { copyFile, link, mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { join, parse } from 'node:path';
 import type { JobOutput, JobSettings, OutputKind, Quality } from '../shared/models';
 import { BLENDER_SCRIPT } from './blender-script';
 import { getDb, jobDir, mediaDir, type JobRow, type MediaRow, type ProjectRow } from './db';
-import { blenderBin, colmapCommand, ffmpegBin, type Command } from './tools';
+import { blenderBin, colmapCommand, ffmpegBin, type ColmapCommand, type Command } from './tools';
 
 /** Longest image side used for dense stereo, per quality preset. */
 const DENSE_SIZE: Record<Quality, number> = { preview: 1000, medium: 2000, high: 3200 };
@@ -169,6 +169,9 @@ class Pipeline {
 
       const colmap = await colmapCommand(dir);
       if (!colmap) throw new Error('COLMAP is not available. See the system status panel.');
+      const cpu = await this.cpuFlags(colmap);
+      if (!colmap.gpu)
+        log.write('No GPU available to COLMAP: extracting and matching features on the CPU\n');
       const db_ = join(dir, 'database.db');
       await rm(db_, { force: true });
 
@@ -184,6 +187,7 @@ class Pipeline {
           imagesDir,
           '--ImageReader.single_camera_per_folder',
           '1',
+          ...cpu.extract,
         ],
         { progress: true },
       );
@@ -192,7 +196,12 @@ class Pipeline {
       const sequential = (videos.length > 0 && photos.length < imageCount / 2) || imageCount > 400;
       await exec(
         colmap,
-        [sequential ? 'sequential_matcher' : 'exhaustive_matcher', '--database_path', db_],
+        [
+          sequential ? 'sequential_matcher' : 'exhaustive_matcher',
+          '--database_path',
+          db_,
+          ...cpu.match,
+        ],
         {
           progress: true,
         },
@@ -257,6 +266,11 @@ class Pipeline {
       ]);
 
       setStage('Dense stereo');
+      if (!colmap.gpu) {
+        throw new Error(
+          'Sparse model done, but dense stereo needs a CUDA GPU. For Docker, install the NVIDIA Container Toolkit, then start a new run.',
+        );
+      }
       await exec(
         colmap,
         [
@@ -342,6 +356,24 @@ class Pipeline {
     } finally {
       await new Promise((r) => log.end(r));
     }
+  }
+
+  /** Without CUDA, feature extraction/matching must be told to use the CPU. Option names changed in COLMAP 3.12. */
+  private async cpuFlags(colmap: ColmapCommand): Promise<{ extract: string[]; match: string[] }> {
+    if (colmap.gpu) return { extract: [], match: [] };
+    const help = await new Promise<string>((resolve) => {
+      execFile(
+        colmap.bin,
+        [...colmap.args, 'feature_extractor', '-h'],
+        { maxBuffer: 4 << 20 },
+        (_e, out, err) => resolve(`${out}${err}`),
+      );
+    });
+    const modern = help.includes('FeatureExtraction.use_gpu');
+    return {
+      extract: [modern ? '--FeatureExtraction.use_gpu' : '--SiftExtraction.use_gpu', '0'],
+      match: [modern ? '--FeatureMatching.use_gpu' : '--SiftMatching.use_gpu', '0'],
+    };
   }
 
   private exec(
