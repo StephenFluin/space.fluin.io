@@ -1,1 +1,199 @@
-/* You can add global styles to this file, and also import other style files */
+:root {
+  color-scheme: light dark;
+  --bg: #f6f7f9;
+  --surface: #ffffff;
+  --surface-2: #eef1f5;
+  --border: #d5dbe3;
+  --text: #17202b;
+  --muted: #4d5968;
+  --accent: #1f5fd1;
+  --accent-text: #ffffff;
+  --danger: #b42318;
+  --ok: #16703a;
+  --warn: #8a5300;
+  --focus: #1f5fd1;
+  --radius: 10px;
+  font-family:
+    system-ui,
+    -apple-system,
+    'Segoe UI',
+    Roboto,
+    sans-serif;
+  line-height: 1.5;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f1318;
+    --surface: #171c23;
+    --surface-2: #212833;
+    --border: #2f3846;
+    --text: #e8edf3;
+    --muted: #a8b3c1;
+    --accent: #6ea2ff;
+    --accent-text: #0b1220;
+    --danger: #ff8a80;
+    --ok: #6fd99b;
+    --warn: #f2c14e;
+    --focus: #8fb8ff;
+  }
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+}
+
+a {
+  color: var(--accent);
+}
+
+h1,
+h2,
+h3 {
+  line-height: 1.2;
+  margin: 0 0 0.75rem;
+}
+
+:focus-visible {
+  outline: 3px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.skip-link {
+  position: absolute;
+  left: 0.5rem;
+  top: -3rem;
+  padding: 0.5rem 0.75rem;
+  background: var(--accent);
+  color: var(--accent-text);
+  z-index: 10;
+  border-radius: 6px;
+  &:focus {
+    top: 0.5rem;
+  }
+}
+
+.page {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 1.5rem;
+}
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1.25rem;
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+  min-height: 2.5rem;
+  padding: 0.45rem 1rem;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text);
+  font: inherit;
+  font-weight: 600;
+  text-decoration: none;
+  cursor: pointer;
+  &:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
+  }
+  &.primary {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: var(--accent-text);
+  }
+  &.danger {
+    color: var(--danger);
+  }
+  &.small {
+    min-height: 2rem;
+    padding: 0.2rem 0.65rem;
+    font-size: 0.875rem;
+  }
+}
+
+.field {
+  display: grid;
+  gap: 0.3rem;
+  label {
+    font-weight: 600;
+    font-size: 0.9rem;
+  }
+  input,
+  select,
+  textarea {
+    font: inherit;
+    padding: 0.5rem 0.65rem;
+    min-height: 2.5rem;
+    border-radius: 8px;
+    border: 1px solid var(--muted);
+    background: var(--surface);
+    color: var(--text);
+  }
+  .hint {
+    color: var(--muted);
+    font-size: 0.85rem;
+  }
+  .error {
+    color: var(--danger);
+    font-size: 0.85rem;
+  }
+}
+
+.badge {
+  display: inline-block;
+  padding: 0.1rem 0.55rem;
+  border-radius: 999px;
+  font-size: 0.8rem;
+  font-weight: 600;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  &.done {
+    color: var(--ok);
+  }
+  &.failed {
+    color: var(--danger);
+  }
+  &.running,
+  &.queued {
+    color: var(--accent);
+  }
+  &.cancelled {
+    color: var(--muted);
+  }
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.visually-hidden {
+  position: absolute !important;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+progress {
+  width: 100%;
+  height: 0.6rem;
+  accent-color: var(--accent);
+}
