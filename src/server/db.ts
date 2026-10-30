@@ -10,15 +10,43 @@ export const DATA_DIR = resolve(process.env['SPACE_DATA_DIR'] ?? 'data');
 const KEY = Symbol.for('space.fluin.io/db');
 const holder = globalThis as unknown as Record<symbol, DatabaseSync | undefined>;
 
+let migrated = false;
+
+/** Adds columns introduced after the first release. Idempotent. */
+function migrate(db: DatabaseSync) {
+  migrated = true;
+  const jobColumns = (db.prepare(`PRAGMA table_info(jobs)`).all() as { name: string }[]).map(
+    (c) => c.name,
+  );
+  if (!jobColumns.includes('worker_pid')) db.exec(`ALTER TABLE jobs ADD COLUMN worker_pid INTEGER`);
+  if (!jobColumns.includes('cancel_requested')) {
+    db.exec(`ALTER TABLE jobs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0`);
+  }
+  if (!jobColumns.includes('stages'))
+    db.exec(`ALTER TABLE jobs ADD COLUMN stages TEXT NOT NULL DEFAULT '[]'`);
+  if (!jobColumns.includes('stats'))
+    db.exec(`ALTER TABLE jobs ADD COLUMN stats TEXT NOT NULL DEFAULT '{}'`);
+
+  const mediaColumns = (db.prepare(`PRAGMA table_info(media)`).all() as { name: string }[]).map(
+    (c) => c.name,
+  );
+  if (!mediaColumns.includes('duration')) db.exec(`ALTER TABLE media ADD COLUMN duration REAL`);
+}
+
 /** Opens the database lazily so the build-time route extraction never touches disk. */
 export function getDb(): DatabaseSync {
   const existing = holder[KEY];
-  if (existing) return existing;
+  if (existing) {
+    // A dev-server reload keeps the connection but may bring new migrations.
+    if (!migrated) migrate(existing);
+    return existing;
+  }
   mkdirSync(DATA_DIR, { recursive: true });
   const db = (holder[KEY] = new DatabaseSync(join(DATA_DIR, 'space.db')));
   db.exec(`
     PRAGMA journal_mode = WAL;
     PRAGMA foreign_keys = ON;
+    PRAGMA busy_timeout = 5000;
 
     CREATE TABLE IF NOT EXISTS projects (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -52,12 +80,33 @@ export function getDb(): DatabaseSync {
       finished_at TEXT
     );
   `);
-  // A running job belonged to a previous server process; queued jobs are picked up again.
-  db.prepare(
-    `UPDATE jobs SET status = 'failed', error = 'Interrupted by server restart', finished_at = datetime('now')
-     WHERE status = 'running'`,
-  ).run();
+  migrate(db);
+
+  // Several servers (e.g. a dev server and a production build) may share this database, so only
+  // fail running jobs whose worker process is gone. Queued jobs are picked up again.
+  const running = db.prepare(`SELECT id, worker_pid FROM jobs WHERE status = 'running'`).all() as {
+    id: number;
+    worker_pid: number | null;
+  }[];
+  for (const job of running) {
+    if (job.worker_pid && isAlive(job.worker_pid)) continue;
+    db.prepare(
+      `UPDATE jobs SET status = 'failed', error = 'Interrupted by server restart', finished_at = datetime('now')
+       WHERE id = ?`,
+    ).run(job.id);
+  }
   return db;
+}
+
+/** Whether another process with this pid is running. */
+export function isAlive(pid: number): boolean {
+  if (pid === process.pid) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'EPERM';
+  }
 }
 
 export interface ProjectRow {
@@ -75,6 +124,7 @@ export interface MediaRow {
   original_name: string;
   type: 'image' | 'video';
   size: number;
+  duration: number | null;
   created_at: string;
 }
 
@@ -87,6 +137,10 @@ export interface JobRow {
   settings: string;
   outputs: string;
   error: string | null;
+  worker_pid: number | null;
+  cancel_requested: number;
+  stages: string;
+  stats: string;
   created_at: string;
   started_at: string | null;
   finished_at: string | null;

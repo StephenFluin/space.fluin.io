@@ -3,7 +3,7 @@ import { DatePipe, DecimalPipe } from '@angular/common';
 import { FormField, form, maxLength, required, submit } from '@angular/forms/signals';
 import { Router, RouterLink } from '@angular/router';
 import { firstValueFrom } from 'rxjs';
-import type { ProjectKind } from '../../shared/models';
+import { DEFAULT_SETTINGS, videoFrames, type Project, type ProjectKind } from '../../shared/models';
 import { Api } from '../api';
 import { SystemStatus } from '../components/system-status';
 
@@ -29,7 +29,7 @@ import { SystemStatus } from '../components/system-status';
               </h2>
               <p class="meta">
                 <span class="badge">{{ p.kind === 'exterior' ? 'Exterior' : 'Interior' }}</span>
-                {{ p.mediaCount }} {{ p.mediaCount === 1 ? 'file' : 'files' }}
+                {{ summary(p) }}
               </p>
               @if (p.latestJob; as j) {
                 <p class="meta">
@@ -179,6 +179,22 @@ export class ProjectsPage {
     required(p.name, { message: 'Give the project a name' });
     maxLength(p.name, 120, { message: 'Keep the name under 120 characters' });
   });
+
+  /** e.g. "12 photos · 1 video (268 frames)" — frames at the fps the next run will likely use. */
+  protected summary(p: Project): string {
+    const parts: string[] = [];
+    if (p.photoCount || !p.videoCount) {
+      parts.push(`${p.photoCount} ${p.photoCount === 1 ? 'photo' : 'photos'}`);
+    }
+    if (p.videoCount) {
+      const fps = p.latestJob?.settings.videoFps ?? DEFAULT_SETTINGS[p.kind].videoFps;
+      parts.push(
+        `${p.videoCount} ${p.videoCount === 1 ? 'video' : 'videos'} ` +
+          `(${videoFrames(p.videoSeconds, fps).toLocaleString()} frames)`,
+      );
+    }
+    return parts.join(' · ');
+  }
 
   protected async create(event: Event) {
     event.preventDefault();

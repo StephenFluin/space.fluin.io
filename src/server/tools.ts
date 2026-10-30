@@ -1,4 +1,6 @@
 import { execFile } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { DATA_DIR } from './db';
 import { promisify } from 'node:util';
 import type { SystemStatus, ToolStatus } from '../shared/models';
 
@@ -58,7 +60,10 @@ async function dockerImagePresent(image: string): Promise<boolean> {
  * docker image (needs the NVIDIA container toolkit for dense reconstruction).
  * Docker mounts the job directory at the same path so all paths stay valid inside the container.
  */
-export async function colmapCommand(mountDir: string): Promise<ColmapCommand | null> {
+export async function colmapCommand(
+  mountDir: string,
+  containerName?: string,
+): Promise<ColmapCommand | null> {
   const hostGpu = async () => (await versionOf('nvidia-smi', ['-L'])) !== null;
   const explicit = process.env['COLMAP_BIN'];
   if (explicit) return { bin: explicit, args: [], gpu: await hostGpu() };
@@ -75,6 +80,7 @@ export async function colmapCommand(mountDir: string): Promise<ColmapCommand | n
         'run',
         '--rm',
         ...(gpu ? ['--gpus', 'all'] : []),
+        ...(containerName ? ['--name', containerName] : []),
         '--user',
         `${uid}:${gid}`,
         '-v',
@@ -89,8 +95,54 @@ export async function colmapCommand(mountDir: string): Promise<ColmapCommand | n
   return null;
 }
 
+/** Containers are namespaced per data directory so separate installs never touch each other's. */
+const CONTAINER_PREFIX = `space-${createHash('sha1').update(DATA_DIR).digest('hex').slice(0, 8)}-job-`;
+
+/** Docker container name for a job, so it can be found and stopped from any server process. */
+export const jobContainerName = (jobId: number) => `${CONTAINER_PREFIX}${jobId}`;
+
+/** Force-removes a container; a no-op if it doesn't exist or docker isn't installed. */
+export async function removeContainer(name: string): Promise<void> {
+  await run('docker', ['rm', '-f', name]).catch(() => undefined);
+}
+
+/** Job ids of this data directory's running containers. */
+export async function jobContainers(): Promise<number[]> {
+  try {
+    const { stdout } = await run('docker', [
+      'ps',
+      '--filter',
+      `name=^${CONTAINER_PREFIX}`,
+      '--format',
+      '{{.Names}}',
+    ]);
+    return stdout
+      .split('\n')
+      .map((n) => Number(n.trim().slice(CONTAINER_PREFIX.length)))
+      .filter((n) => Number.isInteger(n) && n > 0);
+  } catch {
+    return [];
+  }
+}
+
 export const blenderBin = () => process.env['BLENDER_BIN'] ?? 'blender';
 export const ffmpegBin = () => process.env['FFMPEG_BIN'] ?? 'ffmpeg';
+export const ffprobeBin = () => process.env['FFPROBE_BIN'] ?? 'ffprobe';
+
+/** Length of a video in seconds, or null if ffprobe can't read it. */
+export async function videoDuration(path: string): Promise<number | null> {
+  try {
+    const { stdout } = await run(
+      ffprobeBin(),
+      ['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', path],
+      { timeout: 30_000 },
+    );
+    const seconds = parseFloat(stdout);
+    return Number.isFinite(seconds) ? seconds : null;
+  } catch {
+    return null;
+  }
+}
 
 async function versionOf(bin: string, args: string[]): Promise<string | null> {
   try {

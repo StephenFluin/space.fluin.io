@@ -8,20 +8,38 @@ import {
   numberAttribute,
   signal,
 } from '@angular/core';
-import { NgOptimizedImage } from '@angular/common';
+import { DecimalPipe, NgOptimizedImage } from '@angular/common';
 import { FormField, form, max, min, required, submit } from '@angular/forms/signals';
 import { Router, RouterLink } from '@angular/router';
 import { firstValueFrom } from 'rxjs';
-import { DEFAULT_SETTINGS, type JobSettings } from '../../shared/models';
-import { Api, formatBytes, mediaUrl } from '../api';
+import {
+  DEFAULT_SETTINGS,
+  estimateRunSeconds,
+  estimatedGlbBytes,
+  estimatedStlBytes,
+  recommendedFaces,
+  videoFrames,
+  type JobSettings,
+  type ProjectKind,
+} from '../../shared/models';
+import { Api, formatBytes, formatDuration, thumbUrl } from '../api';
 import { JobCard } from '../components/job-card';
 import { MediaUploader } from '../components/media-uploader';
+import { ProjectTitle } from '../components/project-title';
 
 const PREVIEW_LIMIT = 48;
 
 @Component({
   selector: 'app-project-page',
-  imports: [RouterLink, NgOptimizedImage, FormField, JobCard, MediaUploader],
+  imports: [
+    RouterLink,
+    NgOptimizedImage,
+    DecimalPipe,
+    FormField,
+    JobCard,
+    MediaUploader,
+    ProjectTitle,
+  ],
   template: `
     <div class="page">
       <nav aria-label="Breadcrumb">
@@ -34,8 +52,24 @@ const PREVIEW_LIMIT = 48;
       } @else if (project.value(); as p) {
         <header class="head">
           <div>
-            <h1>{{ p.name }}</h1>
-            <span class="badge">{{ p.kind === 'exterior' ? 'Exterior' : 'Interior' }}</span>
+            <app-project-title [projectId]="p.id" [name]="p.name" (renamed)="project.reload()" />
+            <fieldset class="kind">
+              <legend class="visually-hidden">Capture type</legend>
+              @for (k of kinds; track k.value) {
+                <label [class.selected]="p.kind === k.value">
+                  <input
+                    type="radio"
+                    name="kind"
+                    class="visually-hidden"
+                    [value]="k.value"
+                    [checked]="p.kind === k.value"
+                    (change)="setKind(k.value)"
+                  />
+                  {{ k.label }}
+                </label>
+              }
+            </fieldset>
+            <span class="visually-hidden" aria-live="polite">{{ kindMessage() }}</span>
             @if (p.notes) {
               <p class="muted">{{ p.notes }}</p>
             }
@@ -47,9 +81,7 @@ const PREVIEW_LIMIT = 48;
           <section class="card" aria-labelledby="media-heading">
             <h2 id="media-heading">
               Capture
-              <span class="muted count"
-                >{{ photoCount() }} photos · {{ videoCount() }} videos · {{ totalSize() }}</span
-              >
+              <span class="muted count">{{ captureSummary() }} · {{ totalSize() }}</span>
             </h2>
             <details class="tips">
               <summary>
@@ -97,24 +129,18 @@ const PREVIEW_LIMIT = 48;
                 @for (m of visibleMedia(); track m.id) {
                   <li>
                     <div class="thumb">
-                      @if (m.type === 'image') {
-                        <img [ngSrc]="mediaSrc(m.id)" fill sizes="120px" alt="" />
-                      } @else {
-                        <svg
-                          aria-hidden="true"
-                          width="36"
-                          height="36"
-                          viewBox="0 0 24 24"
-                          fill="none"
-                          stroke="currentColor"
-                          stroke-width="2"
-                        >
-                          <rect x="2" y="5" width="15" height="14" rx="2" />
-                          <path d="m17 10 5-3v10l-5-3z" />
-                        </svg>
+                      <img [ngSrc]="thumbSrc(m.id)" fill alt="" />
+                      @if (m.type === 'video') {
+                        <span class="video-badge">Video</span>
                       }
                     </div>
                     <span class="name" [title]="m.originalName">{{ m.originalName }}</span>
+                    <span class="size muted">
+                      {{ size(m.size) }}
+                      @if (m.duration) {
+                        · {{ duration(m.duration) }} · {{ frames(m.duration) }} frames
+                      }
+                    </span>
                     <button
                       class="btn small danger remove"
                       type="button"
@@ -179,7 +205,41 @@ const PREVIEW_LIMIT = 48;
                   type="number"
                   step="50000"
                   [formField]="settingsForm.targetFaces"
+                  aria-describedby="faces-hint"
                 />
+                <div class="presets" role="group" aria-label="Triangle presets">
+                  @for (f of facePresets; track f) {
+                    <button
+                      type="button"
+                      class="btn small"
+                      [attr.aria-pressed]="settings().targetFaces === f"
+                      (click)="setFaces(f)"
+                    >
+                      {{ short(f) }}{{ f === recommended() ? ' ★' : '' }}
+                    </button>
+                  }
+                </div>
+                <span id="faces-hint" class="hint">
+                  ★ {{ short(recommended()) }} suits a {{ settings().printSizeMm }} mm print: any
+                  finer and a 0.4 mm nozzle can't show it. Go higher only for on-screen detail
+                  (walkthroughs). Files: about {{ size(stlBytes()) }} STL, {{ size(glbBytes()) }}
+                  GLB.
+                </span>
+              </div>
+              <div class="estimate" aria-live="polite">
+                <strong>Estimated time: {{ estimate() }}</strong>
+                <span class="hint">
+                  {{ imageTotal() | number }} images ({{ photoCount() }} photos{{
+                    videoCount() ? ' + ' + videoFrameTotal() + ' video frames' : ''
+                  }}).
+                  {{
+                    calibration.value()?.runs
+                      ? 'Calibrated from ' +
+                        calibration.value()!.runs +
+                        ' earlier runs on this machine.'
+                      : 'Rough until a run finishes on this machine.'
+                  }}
+                </span>
               </div>
               @if (settingsForm().invalid()) {
                 <p class="error" role="alert">Check the settings: values are out of range.</p>
@@ -201,7 +261,7 @@ const PREVIEW_LIMIT = 48;
         <section aria-labelledby="runs-heading" class="runs">
           <h2 id="runs-heading">Runs</h2>
           @for (j of jobs.value(); track j.id) {
-            <app-job-card [job]="j" (changed)="jobs.reload()" />
+            <app-job-card [job]="j" [initiallyExpanded]="$first" (changed)="jobs.reload()" />
           } @empty {
             <p class="muted">No runs yet.</p>
           }
@@ -223,9 +283,34 @@ const PREVIEW_LIMIT = 48;
       align-items: flex-start;
       margin-bottom: 1.5rem;
     }
-    .head h1 {
-      display: inline;
+    .kind {
+      display: inline-flex;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 2px;
+      margin: 0;
+      vertical-align: middle;
+      background: var(--surface-2);
+    }
+    .kind label {
+      padding: 0.2rem 0.8rem;
+      border-radius: 999px;
+      font-size: 0.85rem;
+      font-weight: 600;
+      cursor: pointer;
+      color: var(--muted);
+    }
+    .kind label.selected {
+      background: var(--accent);
+      color: var(--accent-text);
+    }
+    .kind label:focus-within {
+      outline: 3px solid var(--focus);
+      outline-offset: 1px;
+    }
+    app-project-title {
       margin-right: 0.6rem;
+      margin-bottom: 0.4rem;
     }
     .layout {
       display: grid;
@@ -272,6 +357,21 @@ const PREVIEW_LIMIT = 48;
       place-items: center;
       color: var(--muted);
     }
+    .video-badge {
+      position: absolute;
+      left: 0.3rem;
+      bottom: 0.3rem;
+      padding: 0 0.4rem;
+      border-radius: 4px;
+      font-size: 0.7rem;
+      font-weight: 700;
+      background: rgba(0, 0, 0, 0.75);
+      color: #fff;
+    }
+    .size {
+      font-size: 0.7rem;
+      margin-top: -0.25rem;
+    }
     .thumb img {
       object-fit: cover;
     }
@@ -288,6 +388,23 @@ const PREVIEW_LIMIT = 48;
       min-height: 1.75rem;
       padding: 0 0.45rem;
       background: var(--surface);
+    }
+    .presets {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.3rem;
+    }
+    .presets [aria-pressed='true'] {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: var(--accent-text);
+    }
+    .estimate {
+      display: grid;
+      gap: 0.2rem;
+      padding: 0.6rem 0.75rem;
+      border-radius: 8px;
+      background: var(--surface-2);
     }
     .settings {
       display: grid;
@@ -321,6 +438,54 @@ export class ProjectPage {
   protected readonly videoCount = computed(
     () => this.media.value().filter((m) => m.type === 'video').length,
   );
+  protected readonly videoSeconds = computed(() =>
+    this.media.value().reduce((n, m) => n + (m.duration ?? 0), 0),
+  );
+  protected readonly videoFrameTotal = computed(() =>
+    videoFrames(this.videoSeconds(), this.settings().videoFps),
+  );
+  protected readonly imageTotal = computed(() => this.photoCount() + this.videoFrameTotal());
+  protected readonly captureSummary = computed(() => {
+    const photos = `${this.photoCount()} ${this.photoCount() === 1 ? 'photo' : 'photos'}`;
+    const v = this.videoCount();
+    if (!v) return photos;
+    return (
+      `${photos} · ${v} ${v === 1 ? 'video' : 'videos'} ` +
+      `(${formatDuration(this.videoSeconds() * 1000)}, ${this.videoFrameTotal()} frames at ` +
+      `${this.settings().videoFps} fps)`
+    );
+  });
+
+  protected readonly calibration = this.api.calibration();
+  protected readonly estimate = computed(() => {
+    if (!this.imageTotal()) return '—';
+    const secs =
+      estimateRunSeconds(this.imageTotal(), this.photoCount(), this.videoCount(), this.settings()) *
+      (this.calibration.value()?.factor ?? 1);
+    return '~' + formatDuration(secs * 1000);
+  });
+
+  protected readonly facePresets = [100_000, 250_000, 500_000, 1_000_000, 2_000_000];
+  protected readonly recommended = computed(() => recommendedFaces(this.settings().printSizeMm));
+  protected readonly stlBytes = computed(() => estimatedStlBytes(this.settings().targetFaces));
+  protected readonly glbBytes = computed(() => estimatedGlbBytes(this.settings().targetFaces));
+
+  protected setFaces(faces: number) {
+    this.settings.update((s) => ({ ...s, targetFaces: faces }));
+  }
+
+  protected short(n: number) {
+    return n >= 1_000_000 ? `${n / 1_000_000}M` : `${n / 1000}k`;
+  }
+
+  protected duration(seconds: number) {
+    return formatDuration(seconds * 1000);
+  }
+
+  protected frames(seconds: number) {
+    return videoFrames(seconds, this.settings().videoFps);
+  }
+
   protected readonly totalSize = computed(() =>
     formatBytes(this.media.value().reduce((n, m) => n + m.size, 0)),
   );
@@ -332,8 +497,9 @@ export class ProjectPage {
   );
 
   /** Settings start from the defaults for the project kind and reset when the kind is known. */
-  private readonly settings = linkedSignal<JobSettings>(() =>
-    structuredClone(DEFAULT_SETTINGS[this.project.value()?.kind ?? 'exterior']),
+  private readonly kind = computed(() => this.project.value()?.kind ?? 'exterior');
+  protected readonly settings = linkedSignal<JobSettings>(() =>
+    structuredClone(DEFAULT_SETTINGS[this.kind()]),
   );
   protected readonly settingsForm = form(this.settings, (s) => {
     required(s.videoFps);
@@ -354,8 +520,25 @@ export class ProjectPage {
     });
   }
 
-  protected mediaSrc(id: number) {
-    return mediaUrl(id);
+  protected readonly kinds: { value: ProjectKind; label: string }[] = [
+    { value: 'exterior', label: 'Exterior' },
+    { value: 'interior', label: 'Interior' },
+  ];
+  protected readonly kindMessage = signal('');
+
+  /** Switching kind also resets the run settings to that kind's defaults (via linkedSignal). */
+  protected async setKind(kind: ProjectKind) {
+    await firstValueFrom(this.api.updateProject(this.id(), { kind }));
+    this.project.reload();
+    this.kindMessage.set(`Switched to ${kind}. Run settings reset to ${kind} defaults.`);
+  }
+
+  protected thumbSrc(id: number) {
+    return thumbUrl(id);
+  }
+
+  protected size(bytes: number) {
+    return formatBytes(bytes);
   }
 
   protected refreshMedia() {

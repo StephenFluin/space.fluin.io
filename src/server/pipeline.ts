@@ -1,30 +1,49 @@
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import { createWriteStream, existsSync, type WriteStream } from 'node:fs';
-import { copyFile, link, mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import {
+  copyFile,
+  link,
+  mkdir,
+  open,
+  readFile,
+  readdir,
+  rm,
+  stat,
+  writeFile,
+} from 'node:fs/promises';
 import { join, parse } from 'node:path';
-import type { JobOutput, JobSettings, OutputKind, Quality } from '../shared/models';
+import {
+  DENSE_SIZE,
+  DENSE_SOURCES,
+  STAGES,
+  useSequentialMatching,
+  type JobOutput,
+  type JobSettings,
+  type JobStats,
+  type OutputKind,
+  type StageName,
+  type StageTiming,
+} from '../shared/models';
 import { BLENDER_SCRIPT } from './blender-script';
-import { getDb, jobDir, mediaDir, type JobRow, type MediaRow, type ProjectRow } from './db';
-import { blenderBin, colmapCommand, ffmpegBin, type ColmapCommand, type Command } from './tools';
-
-/** Longest image side used for dense stereo, per quality preset. */
-const DENSE_SIZE: Record<Quality, number> = { preview: 1000, medium: 2000, high: 3200 };
-
-/** Stage name and the share of overall progress it represents. */
-const STAGES = [
-  ['Preparing images', 0.03],
-  ['Extracting features', 0.07],
-  ['Matching features', 0.1],
-  ['Sparse reconstruction', 0.15],
-  ['Aligning orientation', 0.03],
-  ['Undistorting images', 0.04],
-  ['Dense stereo', 0.35],
-  ['Fusing point cloud', 0.06],
-  ['Meshing', 0.07],
-  ['Post-processing in Blender', 0.1],
-] as const;
-
-type StageName = (typeof STAGES)[number][0];
+import {
+  getDb,
+  isAlive,
+  jobDir,
+  mediaDir,
+  type JobRow,
+  type MediaRow,
+  type ProjectRow,
+} from './db';
+import {
+  blenderBin,
+  colmapCommand,
+  ffmpegBin,
+  jobContainerName,
+  jobContainers,
+  removeContainer,
+  type ColmapCommand,
+  type Command,
+} from './tools';
 
 class Cancelled extends Error {}
 
@@ -35,8 +54,32 @@ class Cancelled extends Error {}
 class Pipeline {
   private running: { jobId: number; child?: ChildProcess; cancelled: boolean } | null = null;
 
+  private cleanedUp = false;
+
   enqueue() {
-    void this.tick();
+    if (!this.cleanedUp) {
+      this.cleanedUp = true;
+      void this.removeOrphans().then(() => this.tick());
+    } else {
+      void this.tick();
+    }
+  }
+
+  /**
+   * COLMAP containers outlive a crashed or restarted server and would keep the GPU busy. Remove any
+   * whose job isn't being run by a live server.
+   */
+  private async removeOrphans() {
+    for (const jobId of await jobContainers()) {
+      const row = getDb().prepare(`SELECT status, worker_pid FROM jobs WHERE id = ?`).get(jobId) as
+        { status: string; worker_pid: number | null } | undefined;
+      const ownedElsewhere =
+        row?.status === 'running' &&
+        row.worker_pid !== null &&
+        row.worker_pid !== process.pid &&
+        isAlive(row.worker_pid);
+      if (!ownedElsewhere) await removeContainer(jobContainerName(jobId));
+    }
   }
 
   cancel(jobId: number): boolean {
@@ -44,8 +87,15 @@ class Pipeline {
     if (this.running?.jobId === jobId) {
       this.running.cancelled = true;
       this.running.child?.kill('SIGTERM');
+      // Killing the docker client doesn't always stop the container itself.
+      void removeContainer(jobContainerName(jobId));
       return true;
     }
+    // A job running in another server process is cancelled by flag; its worker polls for it.
+    const flagged = db
+      .prepare(`UPDATE jobs SET cancel_requested = 1 WHERE id = ? AND status = 'running'`)
+      .run(jobId);
+    if (flagged.changes > 0) return true;
     const res = db
       .prepare(
         `UPDATE jobs SET status = 'cancelled', finished_at = datetime('now') WHERE id = ? AND status = 'queued'`,
@@ -62,10 +112,21 @@ class Pipeline {
       .get() as JobRow | undefined;
     if (!next) return;
 
+    // Claim atomically so two servers sharing the database never run the same job.
+    const claimed = db
+      .prepare(
+        `UPDATE jobs SET status = 'running', worker_pid = ?, started_at = datetime('now'), progress = 0
+         WHERE id = ? AND status = 'queued'`,
+      )
+      .run(process.pid, next.id);
+    if (claimed.changes === 0) return void this.tick();
+
     this.running = { jobId: next.id, cancelled: false };
-    db.prepare(
-      `UPDATE jobs SET status = 'running', started_at = datetime('now'), progress = 0 WHERE id = ?`,
-    ).run(next.id);
+    const cancelPoll = setInterval(() => {
+      const row = db.prepare(`SELECT cancel_requested FROM jobs WHERE id = ?`).get(next.id) as
+        { cancel_requested: number } | undefined;
+      if (!row || row.cancel_requested) this.cancel(next.id);
+    }, 2000);
     try {
       const outputs = await this.process(next);
       db.prepare(
@@ -81,6 +142,7 @@ class Pipeline {
         next.id,
       );
     } finally {
+      clearInterval(cancelPoll);
       this.running = null;
       void this.tick();
     }
@@ -101,17 +163,34 @@ class Pipeline {
 
     const stageStart = (name: StageName) => {
       let start = 0;
-      for (const [n, w] of STAGES) {
-        if (n === name) break;
-        start += w;
+      for (const st of STAGES) {
+        if (st.name === name) break;
+        start += st.weight;
       }
       return start;
     };
+    const timings: StageTiming[] = [];
+    const saveTimings = () =>
+      db.prepare(`UPDATE jobs SET stages = ? WHERE id = ?`).run(JSON.stringify(timings), job.id);
+    const closeStage = () => {
+      const last = timings.at(-1);
+      if (last && !last.finishedAt) last.finishedAt = new Date().toISOString();
+    };
+    const stats: JobStats = {};
+    const addStats = (more: JobStats) => {
+      Object.assign(stats, more);
+      db.prepare(`UPDATE jobs SET stats = ? WHERE id = ?`).run(JSON.stringify(stats), job.id);
+    };
+
     let current: { name: StageName; start: number; weight: number } | null = null;
     const setStage = (name: StageName) => {
       if (this.running?.cancelled) throw new Cancelled();
-      const weight = STAGES.find(([n]) => n === name)![1];
+      const weight = STAGES.find((st) => st.name === name)!.weight;
       current = { name, start: stageStart(name), weight };
+      stageFraction = 0;
+      closeStage();
+      timings.push({ name, startedAt: new Date().toISOString(), finishedAt: null });
+      saveTimings();
       log.write(`\n=== ${name} ===\n`);
       db.prepare(`UPDATE jobs SET stage = ?, progress = ? WHERE id = ?`).run(
         name,
@@ -119,15 +198,42 @@ class Pipeline {
         job.id,
       );
     };
+    let stageFraction = 0;
     const setFraction = (f: number) => {
-      if (!current) return;
+      // Tools print assorted "n / m" counters; never let the bar move backwards within a step.
+      f = Math.min(Math.max(f, 0), 1);
+      if (!current || f <= stageFraction) return;
+      stageFraction = f;
       db.prepare(`UPDATE jobs SET progress = ? WHERE id = ?`).run(
-        current.start + current.weight * Math.min(Math.max(f, 0), 1),
+        current.start + current.weight * f,
         job.id,
       );
     };
-    const exec = (cmd: Command, args: string[], opts: { progress?: boolean } = {}) =>
-      this.exec(cmd, args, log, opts.progress ? setFraction : undefined);
+    const exec = (
+      cmd: Command,
+      args: string[],
+      opts: { progress?: boolean | ((f: number) => void) } = {},
+    ) =>
+      this.exec(
+        cmd,
+        args,
+        log,
+        typeof opts.progress === 'function'
+          ? opts.progress
+          : opts.progress
+            ? setFraction
+            : undefined,
+      );
+    /** For tools that loop over the images several times, restarting their "i / n" counter each pass. */
+    const multiPass = (passes: number) => {
+      let pass = 0;
+      let last = 0;
+      return (f: number) => {
+        if (f < last - 0.5) pass++;
+        last = f;
+        setFraction((Math.min(pass, passes - 1) + f) / passes);
+      };
+    };
 
     try {
       // 1. Gather inputs: link photos (keeping EXIF for focal length priors) and sample video frames.
@@ -165,11 +271,19 @@ class Pipeline {
       if (photos.length === 0) await rm(photosDir, { recursive: true });
       const imageCount = await countFiles(imagesDir);
       log.write(`${imageCount} images (${photos.length} photos, ${videos.length} videos)\n`);
+      addStats({
+        images: imageCount,
+        photos: photos.length,
+        videos: videos.length,
+        videoFrames: imageCount - photos.length,
+      });
       if (imageCount < 3) throw new Error('Need at least 3 images (or a video) to reconstruct');
 
-      const colmap = await colmapCommand(dir);
+      const colmap = await colmapCommand(dir, jobContainerName(job.id));
+      await removeContainer(jobContainerName(job.id));
       if (!colmap) throw new Error('COLMAP is not available. See the system status panel.');
       const cpu = await this.cpuFlags(colmap);
+      addStats({ gpu: colmap.gpu, denseSources: DENSE_SOURCES[settings.quality] });
       if (!colmap.gpu)
         log.write('No GPU available to COLMAP: extracting and matching features on the CPU\n');
       const db_ = join(dir, 'database.db');
@@ -193,7 +307,7 @@ class Pipeline {
       );
 
       setStage('Matching features');
-      const sequential = (videos.length > 0 && photos.length < imageCount / 2) || imageCount > 400;
+      const sequential = useSequentialMatching(imageCount, photos.length, videos.length);
       await exec(
         colmap,
         [
@@ -224,6 +338,8 @@ class Pipeline {
         throw new Error(
           'Sparse reconstruction failed: no images could be registered. Add more overlap.',
         );
+
+      addStats(await this.analyzeModel(colmap, model));
 
       // 4. Gravity alignment so models come out upright. Best effort: unaligned models still mesh fine.
       setStage('Aligning orientation');
@@ -263,6 +379,8 @@ class Pipeline {
         'COLMAP',
         '--max_image_size',
         size,
+        '--num_patch_match_src_images',
+        String(DENSE_SOURCES[settings.quality]),
       ]);
 
       setStage('Dense stereo');
@@ -284,7 +402,8 @@ class Pipeline {
           '--PatchMatchStereo.max_image_size',
           size,
         ],
-        { progress: true },
+        // geom_consistency runs a photometric pass, then a geometric pass, over every view.
+        { progress: multiPass(2) },
       );
 
       setStage('Fusing point cloud');
@@ -304,6 +423,9 @@ class Pipeline {
         ],
         { progress: true },
       );
+
+      const densePoints = await plyVertexCount(fused);
+      if (densePoints !== null) addStats({ densePoints });
 
       // 6. Surface reconstruction. Delaunay copes better with thin walls and textureless interiors.
       setStage('Meshing');
@@ -351,11 +473,44 @@ class Pipeline {
         project.kind,
       ]);
       await copyFile(rawMesh, join(outDir, 'mesh.ply'));
+      try {
+        const post = JSON.parse(await readFile(join(outDir, 'postprocess.json'), 'utf8'));
+        addStats({
+          meshFaces: post.faces,
+          printableFaces: post.printableFaces,
+          dimensionsMm: post.dimensionsMm,
+        });
+      } catch {
+        // Stats are informational only.
+      }
 
       return collectOutputs(outDir);
     } finally {
+      closeStage();
+      saveTimings();
       await new Promise((r) => log.end(r));
     }
+  }
+
+  /** Registered images, point count and reprojection error of a sparse model. */
+  private async analyzeModel(colmap: ColmapCommand, model: string): Promise<JobStats> {
+    const out = await new Promise<string>((resolve) => {
+      execFile(
+        colmap.bin,
+        [...colmap.args, 'model_analyzer', '--path', model],
+        { maxBuffer: 4 << 20 },
+        (_e, stdout, stderr) => resolve(`${stdout}${stderr}`),
+      );
+    });
+    const num = (re: RegExp) => {
+      const m = out.match(re);
+      return m ? Number(m[1]) : undefined;
+    };
+    return {
+      registeredImages: num(/Registered images: (\d+)/),
+      sparsePoints: num(/Points: (\d+)/),
+      reprojectionError: num(/Mean reprojection error: ([\d.]+)/),
+    };
   }
 
   /** Without CUDA, feature extraction/matching must be told to use the CPU. Option names changed in COLMAP 3.12. */
@@ -415,6 +570,26 @@ class Pipeline {
           );
       });
     });
+  }
+}
+
+/** Reads the vertex count from a PLY header without loading the file. */
+async function plyVertexCount(path: string): Promise<number | null> {
+  try {
+    const fh = await open(path, 'r');
+    try {
+      const buf = Buffer.alloc(4096);
+      const { bytesRead } = await fh.read(buf, 0, buf.length, 0);
+      const m = buf
+        .subarray(0, bytesRead)
+        .toString('latin1')
+        .match(/element vertex (\d+)/);
+      return m ? Number(m[1]) : null;
+    } finally {
+      await fh.close();
+    }
+  } catch {
+    return null;
   }
 }
 

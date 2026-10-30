@@ -19,7 +19,20 @@ videos ─┴─ ffmpeg frame sampling ──► features ► matching ► spars
                      └─ model.blend  both meshes with a vertex-colour material
 ```
 
-Jobs run one at a time in the background, survive page reloads, and resume after a restart if they were still queued.
+### How runs are orchestrated
+
+- **The database is the queue.** Starting a run inserts a `queued` row in SQLite. A worker inside the
+  Node server claims the oldest queued row atomically, runs the steps one at a time as child processes
+  (ffmpeg, COLMAP in Docker, Blender), and writes the step, progress, per-step timings and stats back to
+  the row. Only one run executes at a time per server process.
+- **The browser only reads.** Pages poll `/api/projects/:id/jobs` every 2 s, so closing, reloading or
+  opening the app on another device never affects a run.
+- **Server restarts:** queued runs are picked up again automatically. A run that was mid-flight is
+  marked failed ("Interrupted by server restart"), and its COLMAP container (named
+  `space-<hash>-job-<id>`) is removed so it stops using the GPU. Start a new run to retry; it starts
+  from the beginning.
+- **Several servers** (e.g. `ng serve` and a production build) can share one `data/` folder: claims
+  are atomic, each run records its worker's pid, and cancel requests reach whichever process owns the run.
 
 ## Interior and exterior: separate projects
 

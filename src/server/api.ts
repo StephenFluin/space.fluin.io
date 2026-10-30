@@ -6,6 +6,9 @@ import { open, rm, stat, unlink } from 'node:fs/promises';
 import { extname, join } from 'node:path';
 import {
   DEFAULT_SETTINGS,
+  DENSE_SOURCES,
+  estimateRunSeconds,
+  type Calibration,
   type Job,
   type JobSettings,
   type Media,
@@ -24,7 +27,8 @@ import {
   type ProjectRow,
 } from './db';
 import { pipeline } from './pipeline';
-import { systemStatus } from './tools';
+import { thumbnail } from './thumbnails';
+import { systemStatus, videoDuration } from './tools';
 
 const IMAGE_EXT = new Set(['.jpg', '.jpeg', '.png', '.tif', '.tiff', '.bmp']);
 const VIDEO_EXT = new Set(['.mp4', '.mov', '.m4v', '.mkv', '.avi', '.webm']);
@@ -38,6 +42,8 @@ const toJob = (r: JobRow): Job => ({
   progress: r.progress,
   settings: JSON.parse(r.settings),
   outputs: JSON.parse(r.outputs),
+  stages: JSON.parse(r.stages ?? '[]'),
+  stats: JSON.parse(r.stats ?? '{}'),
   error: r.error,
   createdAt: r.created_at,
   startedAt: r.started_at,
@@ -50,13 +56,42 @@ const toMedia = (r: MediaRow): Media => ({
   originalName: r.original_name,
   type: r.type,
   size: r.size,
+  duration: r.duration && r.duration > 0 ? r.duration : null,
   createdAt: r.created_at,
 });
 
+/** Probes any videos whose length isn't known yet (uploads from before durations were stored). */
+async function fillDurations(projectId?: number) {
+  const rows = getDb()
+    .prepare(
+      `SELECT * FROM media WHERE type = 'video' AND duration IS NULL` +
+        (projectId === undefined ? '' : ` AND project_id = ${Number(projectId)}`),
+    )
+    .all() as unknown as MediaRow[];
+  for (const m of rows) {
+    const seconds = await videoDuration(join(mediaDir(m.project_id), m.filename));
+    // -1 marks unreadable files so they aren't probed on every request.
+    getDb()
+      .prepare(`UPDATE media SET duration = ? WHERE id = ?`)
+      .run(seconds ?? -1, m.id);
+  }
+}
+
 function toProject(r: ProjectRow): Project {
   const db = getDb();
-  const { n } = db.prepare(`SELECT COUNT(*) AS n FROM media WHERE project_id = ?`).get(r.id) as {
+  const counts = db
+    .prepare(
+      `SELECT COUNT(*) AS n,
+              SUM(type = 'image') AS photos,
+              SUM(type = 'video') AS videos,
+              SUM(CASE WHEN type = 'video' AND duration > 0 THEN duration ELSE 0 END) AS seconds
+       FROM media WHERE project_id = ?`,
+    )
+    .get(r.id) as {
     n: number;
+    photos: number | null;
+    videos: number | null;
+    seconds: number | null;
   };
   const job = db
     .prepare(`SELECT * FROM jobs WHERE project_id = ? ORDER BY id DESC LIMIT 1`)
@@ -67,7 +102,10 @@ function toProject(r: ProjectRow): Project {
     kind: r.kind,
     notes: r.notes,
     createdAt: r.created_at,
-    mediaCount: n,
+    mediaCount: counts.n,
+    photoCount: counts.photos ?? 0,
+    videoCount: counts.videos ?? 0,
+    videoSeconds: counts.seconds ?? 0,
     latestJob: job ? toJob(job) : null,
   };
 }
@@ -131,12 +169,37 @@ export function createApi() {
     next();
   });
 
+  /** How much slower or faster than the built-in estimate past runs on this machine were. */
+  api.get('/calibration', (_req, res) => {
+    const rows = getDb()
+      .prepare(`SELECT * FROM jobs WHERE status = 'done' ORDER BY id DESC LIMIT 20`)
+      .all() as unknown as JobRow[];
+    const ratios: number[] = [];
+    for (const job of rows.map(toJob)) {
+      const { images, photos = 0, videos = 0, denseSources } = job.stats;
+      // Only runs whose settings the current model describes.
+      if (!images || !job.stages.length || denseSources !== DENSE_SOURCES[job.settings.quality])
+        continue;
+      const actual = job.stages.reduce(
+        (n, t) => n + (t.finishedAt ? Date.parse(t.finishedAt) - Date.parse(t.startedAt) : 0),
+        0,
+      );
+      const predicted = estimateRunSeconds(images, photos, videos, job.settings) * 1000;
+      if (actual > 0 && predicted > 0) ratios.push(actual / predicted);
+    }
+    ratios.sort((a, b) => a - b);
+    const median = ratios.length ? ratios[Math.floor(ratios.length / 2)] : 1;
+    const body: Calibration = { factor: Math.min(Math.max(median, 0.2), 20), runs: ratios.length };
+    res.json(body);
+  });
+
   api.get('/system', async (_req, res) => {
     res.json(await systemStatus());
   });
 
   // --- projects ---
-  api.get('/projects', (_req, res) => {
+  api.get('/projects', async (_req, res) => {
+    await fillDurations();
     const rows = getDb()
       .prepare(`SELECT * FROM projects ORDER BY id DESC`)
       .all() as unknown as ProjectRow[];
@@ -157,7 +220,8 @@ export function createApi() {
     res.status(201).json(toProject(getProject(Number(r.lastInsertRowid))!));
   });
 
-  api.get('/projects/:id', (req, res) => {
+  api.get('/projects/:id', async (req, res) => {
+    await fillDurations(id(req));
     const p = getProject(id(req));
     if (!p) return void notFound(res);
     res.json(toProject(p));
@@ -169,7 +233,10 @@ export function createApi() {
     const name =
       typeof req.body?.name === 'string' && req.body.name.trim() ? req.body.name.trim() : p.name;
     const notes = typeof req.body?.notes === 'string' ? req.body.notes : p.notes;
-    getDb().prepare(`UPDATE projects SET name = ?, notes = ? WHERE id = ?`).run(name, notes, p.id);
+    const kind = isKind(req.body?.kind) ? req.body.kind : p.kind;
+    getDb()
+      .prepare(`UPDATE projects SET name = ?, notes = ?, kind = ? WHERE id = ?`)
+      .run(name, notes, kind, p.id);
     res.json(toProject(getProject(p.id)!));
   });
 
@@ -186,7 +253,8 @@ export function createApi() {
   });
 
   // --- media ---
-  api.get('/projects/:id/media', (req, res) => {
+  api.get('/projects/:id/media', async (req, res) => {
+    await fillDurations(id(req));
     const rows = getDb()
       .prepare(`SELECT * FROM media WHERE project_id = ? ORDER BY id`)
       .all(id(req)) as unknown as MediaRow[];
@@ -197,7 +265,7 @@ export function createApi() {
     '/projects/:id/media',
     (req, res, next) => (getProject(id(req)) ? next() : notFound(res)),
     upload.array('files'),
-    (req, res) => {
+    async (req, res) => {
       const files = (req.files ?? []) as Express.Multer.File[];
       const insert = getDb().prepare(
         `INSERT INTO media (project_id, filename, original_name, type, size) VALUES (?, ?, ?, ?, ?)`,
@@ -211,7 +279,16 @@ export function createApi() {
             .get(Number(r.lastInsertRowid)) as unknown as MediaRow,
         );
       });
-      res.status(201).json(created);
+      await fillDurations(id(req));
+      res
+        .status(201)
+        .json(
+          created.map((m) =>
+            toMedia(
+              getDb().prepare(`SELECT * FROM media WHERE id = ?`).get(m.id) as unknown as MediaRow,
+            ),
+          ),
+        );
     },
   );
 
@@ -222,12 +299,24 @@ export function createApi() {
     res.sendFile(join(mediaDir(m.project_id), m.filename), { maxAge: '1d' });
   });
 
+  api.get('/media/:id/thumb', async (req, res) => {
+    const m = getDb().prepare(`SELECT * FROM media WHERE id = ?`).get(id(req)) as
+      MediaRow | undefined;
+    if (!m) return void notFound(res);
+    try {
+      res.sendFile(await thumbnail(m), { maxAge: '7d' });
+    } catch {
+      res.status(422).json({ error: 'Could not create a preview of this file' });
+    }
+  });
+
   api.delete('/media/:id', async (req, res) => {
     const m = getDb().prepare(`SELECT * FROM media WHERE id = ?`).get(id(req)) as
       MediaRow | undefined;
     if (!m) return void notFound(res);
     getDb().prepare(`DELETE FROM media WHERE id = ?`).run(m.id);
     await unlink(join(mediaDir(m.project_id), m.filename)).catch(() => undefined);
+    await unlink(join(projectDir(m.project_id), 'thumbs', `${m.id}.jpg`)).catch(() => undefined);
     res.status(204).end();
   });
 

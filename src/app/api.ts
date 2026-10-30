@@ -1,7 +1,15 @@
 import { HttpClient, HttpEventType, httpResource } from '@angular/common/http';
 import { Service, inject } from '@angular/core';
 import { Observable, filter, map } from 'rxjs';
-import type { Job, JobSettings, Media, Project, ProjectKind, SystemStatus } from '../shared/models';
+import type {
+  Calibration,
+  Job,
+  JobSettings,
+  Media,
+  Project,
+  ProjectKind,
+  SystemStatus,
+} from '../shared/models';
 
 export type UploadEvent = { progress: number } | { done: Media[] };
 
@@ -11,6 +19,7 @@ export class Api {
   private readonly http = inject(HttpClient);
 
   system = () => httpResource<SystemStatus>(() => '/api/system');
+  calibration = () => httpResource<Calibration>(() => '/api/calibration');
   projects = () => httpResource<Project[]>(() => '/api/projects', { defaultValue: [] });
   project = (id: () => number) => httpResource<Project>(() => `/api/projects/${id()}`);
   media = (id: () => number) =>
@@ -21,6 +30,10 @@ export class Api {
 
   createProject(body: { name: string; kind: ProjectKind; notes: string }) {
     return this.http.post<Project>('/api/projects', body);
+  }
+
+  updateProject(id: number, changes: Partial<Pick<Project, 'name' | 'kind' | 'notes'>>) {
+    return this.http.patch<Project>(`/api/projects/${id}`, changes);
   }
 
   deleteProject(id: number) {
@@ -67,6 +80,7 @@ export class Api {
 }
 
 export const mediaUrl = (id: number) => `/api/media/${id}/file`;
+export const thumbUrl = (id: number) => `/api/media/${id}/thumb`;
 export const outputUrl = (jobId: number, file: string, download = false) =>
   `/api/jobs/${jobId}/files/${file}${download ? '?download' : ''}`;
 
@@ -78,4 +92,19 @@ export function formatBytes(n: number): string {
     i++;
   }
   return `${n.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
+}
+
+/** SQLite `datetime('now')` values are UTC without a zone; ISO strings pass through. */
+export function parseTime(value: string): Date {
+  return new Date(/[zZ]|[+-]\d\d:?\d\d$/.test(value) ? value : value.replace(' ', 'T') + 'Z');
+}
+
+export function formatDuration(ms: number): string {
+  const secs = Math.max(0, Math.round(ms / 1000));
+  const h = Math.floor(secs / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  const s = secs % 60;
+  if (h) return `${h}h ${m}m`;
+  if (m) return `${m}m ${s}s`;
+  return `${s}s`;
 }

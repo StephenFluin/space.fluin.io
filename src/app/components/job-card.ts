@@ -1,53 +1,104 @@
-import { Component, computed, effect, inject, input, output, signal } from '@angular/core';
+import {
+  Component,
+  computed,
+  effect,
+  inject,
+  input,
+  linkedSignal,
+  output,
+  signal,
+} from '@angular/core';
 import { DatePipe, DecimalPipe } from '@angular/common';
 import { RouterLink } from '@angular/router';
-import type { Job, OutputKind } from '../../shared/models';
-import { Api, formatBytes, outputUrl } from '../api';
+import { STAGES, type Job, type OutputKind } from '../../shared/models';
+import { Api, formatBytes, formatDuration, outputUrl, parseTime } from '../api';
 
 const OUTPUT_LABELS: Record<OutputKind, string> = {
-  stl: 'STL for 3D printing',
-  blend: 'Blender file',
-  glb: 'glTF (GLB) model',
-  ply: 'Raw mesh (PLY)',
-  obj: 'OBJ model',
+  stl: 'STL',
+  blend: 'Blender',
+  glb: 'glTF',
+  ply: 'Raw PLY',
+  obj: 'OBJ',
 };
 
-/** One reconstruction run: progress, log, downloads and a link into the explorer. */
+const OUTPUT_HINTS: Record<OutputKind, string> = {
+  stl: 'watertight solid for slicers',
+  blend: 'coloured scan + printable mesh',
+  glb: 'coloured mesh for viewers',
+  ply: 'unprocessed COLMAP mesh',
+  obj: 'mesh',
+};
+
+const STATUS_LABELS: Record<Job['status'], string> = {
+  queued: 'Queued',
+  running: 'Running',
+  done: 'Done',
+  failed: 'Failed',
+  cancelled: 'Cancelled',
+};
+
+type StepState = 'done' | 'current' | 'failed' | 'pending' | 'skipped';
+
+/** One reconstruction run: step-by-step progress with ETA, run facts, downloads and the log. */
 @Component({
   selector: 'app-job-card',
   imports: [DatePipe, DecimalPipe, RouterLink],
   template: `
     @let j = job();
     <article class="card" [attr.aria-labelledby]="'job-' + j.id">
-      <header>
-        <h3 [id]="'job-' + j.id">Run #{{ j.id }}</h3>
-        <span class="badge" [class]="j.status">{{ j.status }}</span>
-        <span class="muted settings">
-          {{ j.settings.quality }} quality · {{ j.settings.mesher }} mesh ·
-          {{ j.settings.printSizeMm }} mm print
-        </span>
+      <header class="top">
+        <div class="title">
+          <h3 [id]="'job-' + j.id">Run #{{ j.id }}</h3>
+          <span class="badge" [class]="j.status">{{ statusLabel() }}</span>
+        </div>
+        <p class="when muted">
+          @if (j.startedAt) {
+            Started {{ parse(j.startedAt) | date: 'MMM d, h:mm a' }}
+          } @else {
+            Queued {{ parse(j.createdAt) | date: 'MMM d, h:mm a' }}
+          }
+          @if (elapsed(); as e) {
+            · {{ active() ? 'running for' : 'took' }} {{ e }}
+          }
+        </p>
       </header>
+      <p class="settings muted">
+        {{ qualityLabel() }} quality ·
+        {{ j.settings.mesher === 'poisson' ? 'Poisson' : 'Delaunay' }} mesh ·
+        {{ j.settings.videoFps }} fps video · {{ j.settings.printSizeMm }} mm print ·
+        {{ j.settings.targetFaces | number }} triangles
+      </p>
 
       @if (active()) {
-        <p class="stage" aria-live="polite">
-          {{ j.stage }} — {{ j.progress * 100 | number: '1.0-0' }}%
-        </p>
-        <progress
-          [value]="j.progress"
-          max="1"
-          [attr.aria-label]="'Run ' + j.id + ' progress'"
-        ></progress>
-      }
-      @if (j.status === 'failed' && j.error) {
-        <p class="error" role="alert">{{ j.error }}</p>
+        <div class="progress" aria-live="polite">
+          <div class="progress-text">
+            <span>
+              <strong>Step {{ currentStep() }} of {{ steps.length }}</strong> · {{ j.stage }}
+            </span>
+            <span>{{ j.progress * 100 | number: '1.0-0' }}%</span>
+          </div>
+          <progress
+            [value]="j.progress"
+            max="1"
+            [attr.aria-label]="'Run ' + j.id + ' progress'"
+          ></progress>
+          <p class="eta muted">
+            @if (j.status === 'queued') {
+              Waiting for the run ahead of it to finish.
+            } @else if (eta(); as e) {
+              About {{ e.remaining }} left · done around {{ e.at | date: 'h:mm a' }}
+            } @else {
+              Estimating time remaining…
+            }
+          </p>
+        </div>
       }
 
-      <p class="muted times">
-        Queued {{ j.createdAt + 'Z' | date: 'short' }}
-        @if (duration(); as d) {
-          · ran for {{ d }}
-        }
-      </p>
+      @if (j.status === 'failed' && j.error) {
+        <p class="error" role="alert">
+          <strong>Failed during {{ j.stage }}:</strong> {{ j.error }}
+        </p>
+      }
 
       @if (j.outputs.length) {
         <div class="outputs">
@@ -55,21 +106,110 @@ const OUTPUT_LABELS: Record<OutputKind, string> = {
             <a
               class="btn primary"
               [routerLink]="['/projects', j.projectId, 'jobs', j.id, 'explore']"
-              >Explore in 3D</a
             >
+              Explore in 3D
+            </a>
           }
-          <ul>
-            @for (o of j.outputs; track o.file) {
-              <li>
-                <a [href]="url(o.file)" download>{{ labels[o.kind] }}</a>
-                <span class="muted">{{ size(o.size) }}</span>
-              </li>
-            }
-          </ul>
+          @for (o of j.outputs; track o.file) {
+            <a class="btn download" [href]="url(o.file)" download [title]="hints[o.kind]">
+              <span>{{ labels[o.kind] }}</span>
+              <span class="muted">{{ size(o.size) }}</span>
+            </a>
+          }
+        </div>
+      }
+
+      @if (expanded()) {
+        <div class="body">
+          <div>
+            <h4 [id]="'steps-' + j.id">
+              Steps <span class="muted">{{ doneCount() }} of {{ steps.length }} complete</span>
+            </h4>
+            <ol class="steps">
+              @for (s of stepRows(); track s.name) {
+                <li [class]="s.state" [attr.aria-current]="s.state === 'current' ? 'step' : null">
+                  <span class="icon" aria-hidden="true">{{ icons[s.state] }}</span>
+                  <span class="step-name">
+                    {{ s.name }}<span class="visually-hidden">, {{ s.state }}</span>
+                  </span>
+                  <span class="step-time muted">{{ s.time }}</span>
+                </li>
+              }
+            </ol>
+          </div>
+
+          <div>
+            <h4 [id]="'facts-' + j.id">Details</h4>
+            <dl class="facts">
+              @if (j.stats.images !== undefined) {
+                <dt>Input</dt>
+                <dd>
+                  {{ j.stats.images | number }} images
+                  @if (j.stats.videos) {
+                    <span class="muted">
+                      ({{ j.stats.photos }} photos + {{ j.stats.videoFrames | number }} frames from
+                      {{ j.stats.videos }} {{ j.stats.videos === 1 ? 'video' : 'videos' }})
+                    </span>
+                  }
+                </dd>
+              } @else {
+                <dt>Input</dt>
+                <dd class="muted">Recorded once the run starts.</dd>
+              }
+              @if (j.stats.registeredImages !== undefined) {
+                <dt>Cameras placed</dt>
+                <dd>
+                  {{ j.stats.registeredImages | number }} of {{ j.stats.images | number }}
+                  <span class="muted">({{ registeredPct() | number: '1.0-0' }}%)</span>
+                </dd>
+              }
+              @if (j.stats.sparsePoints !== undefined) {
+                <dt>Sparse points</dt>
+                <dd>
+                  {{ j.stats.sparsePoints | number }}
+                  @if (j.stats.reprojectionError !== undefined) {
+                    <span class="muted"
+                      >· {{ j.stats.reprojectionError | number: '1.2-2' }} px error</span
+                    >
+                  }
+                </dd>
+              }
+              @if (j.stats.densePoints !== undefined) {
+                <dt>Dense points</dt>
+                <dd>{{ j.stats.densePoints | number }}</dd>
+              }
+              @if (j.stats.meshFaces !== undefined) {
+                <dt>Mesh</dt>
+                <dd>
+                  {{ j.stats.meshFaces | number }} triangles
+                  <span class="muted">· printable {{ j.stats.printableFaces | number }}</span>
+                </dd>
+              }
+              @if (j.stats.dimensionsMm; as d) {
+                <dt>Print size</dt>
+                <dd>
+                  {{ d[0] | number: '1.0-0' }} × {{ d[1] | number: '1.0-0' }} ×
+                  {{ d[2] | number: '1.0-0' }} mm
+                </dd>
+              }
+              @if (j.stats.gpu !== undefined) {
+                <dt>Hardware</dt>
+                <dd>{{ j.stats.gpu ? 'CUDA GPU' : 'CPU only' }}</dd>
+              }
+            </dl>
+          </div>
         </div>
       }
 
       <div class="actions">
+        <button
+          class="btn small"
+          type="button"
+          (click)="expanded.set(!expanded())"
+          [attr.aria-expanded]="expanded()"
+        >
+          {{ expanded() ? 'Hide details' : 'Show details' }}
+        </button>
         <button
           class="btn small"
           type="button"
@@ -80,7 +220,7 @@ const OUTPUT_LABELS: Record<OutputKind, string> = {
           {{ showLog() ? 'Hide log' : 'Show log' }}
         </button>
         @if (active()) {
-          <button class="btn small danger" type="button" (click)="cancel()">Cancel</button>
+          <button class="btn small danger" type="button" (click)="cancel()">Cancel run</button>
         } @else {
           <button class="btn small danger" type="button" (click)="remove()">Delete run</button>
         }
@@ -93,50 +233,135 @@ const OUTPUT_LABELS: Record<OutputKind, string> = {
     </article>
   `,
   styles: `
-    header {
+    .card {
+      display: grid;
+      gap: 0.75rem;
+    }
+    .top {
+      display: flex;
+      justify-content: space-between;
+      gap: 0.5rem 1rem;
+      flex-wrap: wrap;
+      align-items: baseline;
+    }
+    .title {
       display: flex;
       gap: 0.6rem;
       align-items: center;
-      flex-wrap: wrap;
     }
     h3 {
       margin: 0;
-      font-size: 1.05rem;
+      font-size: 1.1rem;
     }
-    .settings {
+    h4 {
+      margin: 0 0 0.5rem;
+      font-size: 0.95rem;
+    }
+    h4 .muted {
+      font-weight: 400;
+      font-size: 0.85rem;
+      margin-left: 0.3rem;
+    }
+    p {
+      margin: 0;
+    }
+    .when,
+    .settings,
+    .eta {
       font-size: 0.85rem;
     }
-    .stage {
-      margin: 0.75rem 0 0.25rem;
+    .progress {
+      display: grid;
+      gap: 0.3rem;
     }
-    .times {
-      font-size: 0.85rem;
-      margin: 0.5rem 0;
+    .progress-text {
+      display: flex;
+      justify-content: space-between;
+      gap: 1rem;
+    }
+    progress {
+      height: 0.75rem;
     }
     .error {
       color: var(--danger);
     }
     .outputs {
       display: flex;
-      gap: 1rem;
+      gap: 0.5rem;
       flex-wrap: wrap;
-      align-items: flex-start;
-      margin: 0.75rem 0;
     }
-    ul {
+    .download .muted {
+      font-weight: 400;
+      font-size: 0.8rem;
+    }
+    .body {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      gap: 1.5rem;
+      padding-top: 0.75rem;
+      border-top: 1px solid var(--border);
+    }
+    @media (max-width: 700px) {
+      .body {
+        grid-template-columns: 1fr;
+      }
+    }
+    .steps {
+      list-style: none;
       margin: 0;
-      padding-left: 1.1rem;
+      padding: 0;
+      display: grid;
+      gap: 0.15rem;
+      font-size: 0.9rem;
     }
-    li span {
-      margin-left: 0.4rem;
-      font-size: 0.85rem;
+    .steps li {
+      display: grid;
+      grid-template-columns: 1.3rem 1fr auto;
+      align-items: baseline;
+      padding: 0.15rem 0.4rem;
+      border-radius: 6px;
+    }
+    .steps li.done .icon {
+      color: var(--ok);
+    }
+    .steps li.failed {
+      color: var(--danger);
+    }
+    .steps li.current {
+      background: var(--surface-2);
+      font-weight: 600;
+    }
+    .steps li.current .icon {
+      color: var(--accent);
+    }
+    .steps li.pending,
+    .steps li.skipped {
+      color: var(--muted);
+    }
+    .step-time {
+      font-size: 0.8rem;
+      font-variant-numeric: tabular-nums;
+    }
+    .facts {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 0.3rem 1rem;
+      margin: 0;
+      font-size: 0.9rem;
+    }
+    dt {
+      color: var(--muted);
+    }
+    dd {
+      margin: 0;
     }
     .actions {
       display: flex;
       gap: 0.5rem;
+      flex-wrap: wrap;
     }
     .log {
-      margin: 0.75rem 0 0;
+      margin: 0;
       max-height: 320px;
       overflow: auto;
       padding: 0.75rem;
@@ -151,23 +376,113 @@ const OUTPUT_LABELS: Record<OutputKind, string> = {
 export class JobCard {
   private readonly api = inject(Api);
   readonly job = input.required<Job>();
+  /** The newest run starts expanded; older runs collapse to a summary. */
+  readonly initiallyExpanded = input(false);
   readonly changed = output<void>();
 
   protected readonly labels = OUTPUT_LABELS;
+  protected readonly hints = OUTPUT_HINTS;
+  protected readonly icons: Record<StepState, string> = {
+    done: '✓',
+    failed: '✕',
+    current: '●',
+    skipped: '–',
+    pending: '○',
+  };
+  protected readonly steps = STAGES;
+  protected readonly parse = parseTime;
+  protected readonly expanded = linkedSignal(() => this.initiallyExpanded());
   protected readonly showLog = signal(false);
   protected readonly log = signal('');
+  /** Ticks every second while the run is active so durations and the ETA stay live. */
+  private readonly now = signal(Date.now());
+
   protected readonly active = computed(() => ['queued', 'running'].includes(this.job().status));
   protected readonly hasGlb = computed(() => this.job().outputs.some((o) => o.kind === 'glb'));
-  protected readonly duration = computed(() => {
+  protected readonly statusLabel = computed(() => STATUS_LABELS[this.job().status]);
+  protected readonly qualityLabel = computed(() => {
+    const q = this.job().settings.quality;
+    return q[0].toUpperCase() + q.slice(1);
+  });
+  protected readonly registeredPct = computed(() => {
+    const { registeredImages = 0, images = 0 } = this.job().stats;
+    return images ? (registeredImages / images) * 100 : 0;
+  });
+
+  protected readonly elapsed = computed(() => {
     const { startedAt, finishedAt } = this.job();
-    if (!startedAt || !finishedAt) return '';
-    const secs = (Date.parse(finishedAt + 'Z') - Date.parse(startedAt + 'Z')) / 1000;
-    const h = Math.floor(secs / 3600);
-    const m = Math.floor((secs % 3600) / 60);
-    return h ? `${h}h ${m}m` : m ? `${m}m` : `${Math.round(secs)}s`;
+    if (!startedAt) return '';
+    const end = finishedAt ? parseTime(finishedAt).getTime() : this.now();
+    return formatDuration(end - parseTime(startedAt).getTime());
+  });
+
+  private readonly stageIndex = computed(() =>
+    STAGES.findIndex((s) => s.name === this.job().stage),
+  );
+  protected readonly currentStep = computed(() => Math.max(this.stageIndex(), 0) + 1);
+
+  protected readonly stepRows = computed(() => {
+    const j = this.job();
+    const now = this.now();
+    const timings = new Map(j.stages.map((t) => [t.name, t]));
+    const idx = this.stageIndex();
+    return STAGES.map((s, i) => {
+      const t = timings.get(s.name);
+      let state: StepState = 'pending';
+      if (j.status === 'done') state = t || !j.stages.length ? 'done' : 'skipped';
+      else if (i < idx) state = 'done';
+      else if (i === idx && j.status === 'running') state = 'current';
+      else if (i === idx && j.status === 'failed') state = 'failed';
+      let time = '';
+      if (t) {
+        const end = t.finishedAt
+          ? parseTime(t.finishedAt).getTime()
+          : state === 'current'
+            ? now
+            : null;
+        if (end !== null) time = formatDuration(end - parseTime(t.startedAt).getTime());
+      }
+      return { name: s.name, state, time };
+    });
+  });
+
+  protected readonly doneCount = computed(
+    () => this.stepRows().filter((s) => s.state === 'done').length,
+  );
+
+  /**
+   * Remaining time from the observed speed: the current step's pace once it has made some
+   * progress (stage weights are calibrated to real runs), otherwise the whole run's pace.
+   */
+  protected readonly eta = computed(() => {
+    const j = this.job();
+    if (j.status !== 'running' || !j.startedAt) return null;
+    const now = this.now();
+    const idx = this.stageIndex();
+    if (idx < 0) return null;
+    const before = STAGES.slice(0, idx).reduce((n, s) => n + s.weight, 0);
+    const weight = STAGES[idx].weight;
+    const fraction = (j.progress - before) / weight;
+    const timing = j.stages.find((t) => t.name === j.stage);
+    const stageMs = timing ? now - parseTime(timing.startedAt).getTime() : 0;
+    const totalMs = now - parseTime(j.startedAt).getTime();
+
+    let msPerUnit: number | null = null;
+    if (fraction > 0.05 && stageMs > 10_000) msPerUnit = stageMs / (fraction * weight);
+    else if (j.progress > 0.1 && totalMs > 30_000) msPerUnit = totalMs / j.progress;
+    if (msPerUnit === null) return null;
+
+    const remainingMs = msPerUnit * (1 - j.progress);
+    return { remaining: formatDuration(remainingMs), at: new Date(now + remainingMs) };
   });
 
   constructor() {
+    effect((onCleanup) => {
+      if (!this.active()) return;
+      const timer = setInterval(() => this.now.set(Date.now()), 1000);
+      onCleanup(() => clearInterval(timer));
+    });
+
     // Refresh the log whenever it is open and the job has moved on (the parent polls the job).
     effect(() => {
       this.job().progress;
@@ -185,6 +500,7 @@ export class JobCard {
   }
 
   protected cancel() {
+    if (!confirm(`Cancel run #${this.job().id}?`)) return;
     this.api.cancelJob(this.job().id).subscribe(() => this.changed.emit());
   }
 
