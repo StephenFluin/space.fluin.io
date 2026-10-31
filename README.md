@@ -65,8 +65,10 @@ project containing all of it can register both sides together. Large houses also
   - `colmap` on your `PATH` (e.g. `apt install colmap`, or build it from source with CUDA)
   - `COLMAP_BIN=/path/to/colmap`
   - Docker plus the NVIDIA container toolkit: `docker pull colmap/colmap:latest`. It is picked up automatically.
-    RTX 50-series (Blackwell) cards need a COLMAP build against CUDA 12.8+. If dense stereo fails with a
-    "no kernel image" error, build COLMAP from source with `CMAKE_CUDA_ARCHITECTURES=120`.
+    The published image has no native RTX 50-series (sm_120) kernels, but its CUDA code is compiled for the card
+    when it loads and then runs at full speed. On an RTX 5090, a native sm_120 build (`scripts/build-colmap.sh`)
+    took 762 s against the stock image's 761 s for the same 48 depth maps. Build it only if dense stereo fails with
+    "no kernel image", then start the app with `COLMAP_DOCKER_IMAGE=colmap-sm120:4.2.1`.
 - **Blender 4.2+** (`BLENDER_BIN` to override). Official blender.org builds also Draco-compress the GLB.
 - **FFmpeg** for videos (`FFMPEG_BIN` to override)
 
