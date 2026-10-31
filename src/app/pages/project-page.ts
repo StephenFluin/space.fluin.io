@@ -12,7 +12,16 @@ import {
   signal,
 } from '@angular/core';
 import { DecimalPipe, NgOptimizedImage } from '@angular/common';
-import { FormField, form, max, min, required, submit } from '@angular/forms/signals';
+import {
+  FormField,
+  form,
+  max,
+  min,
+  required,
+  submit,
+  type FieldTree,
+  type SchemaPath,
+} from '@angular/forms/signals';
 import { Router, RouterLink } from '@angular/router';
 import { firstValueFrom } from 'rxjs';
 import {
@@ -35,6 +44,22 @@ import { CaptureGuide } from '../components/capture-guide';
 import { ProjectTitle } from '../components/project-title';
 
 const PREVIEW_LIMIT = 48;
+
+/**
+ * Requires a number in [lo, hi], with one message for every way it can fail. `describe` gets
+ * ", you entered N" (or ", but it's empty") to weave into the sentence.
+ */
+function range(path: SchemaPath<number>, lo: number, hi: number, describe: (v: string) => string) {
+  const message = ({ value }: { value: () => number | null }) => {
+    const v = value();
+    return describe(
+      v === null || Number.isNaN(v) ? ", but it's empty" : `; you entered ${v.toLocaleString()}`,
+    );
+  };
+  required(path, { message });
+  min(path, lo, { message });
+  max(path, hi, { message });
+}
 
 @Component({
   selector: 'app-project-page',
@@ -101,7 +126,8 @@ const PREVIEW_LIMIT = 48;
                       <img [ngSrc]="thumbSrc(m.id)" fill alt="" />
                       @if (m.type === 'video' || m.spherical) {
                         <span class="video-badge">
-                          {{ m.spherical ? '360°' : '' }} {{ m.type === 'video' ? 'Video' : 'Photo' }}
+                          {{ m.spherical ? '360°' : '' }}
+                          {{ m.type === 'video' ? 'Video' : 'Photo' }}
                         </span>
                       }
                     </div>
@@ -166,11 +192,35 @@ const PREVIEW_LIMIT = 48;
               </div>
               <div class="field">
                 <label for="fps">Video frames per second</label>
-                <input id="fps" type="number" step="0.25" [formField]="settingsForm.videoFps" />
+                <input
+                  id="fps"
+                  type="number"
+                  step="0.25"
+                  [formField]="settingsForm.videoFps"
+                  [attr.aria-invalid]="settingsForm.videoFps().invalid()"
+                  [attr.aria-describedby]="settingsForm.videoFps().invalid() ? 'fps-error' : null"
+                />
+                @if (settingsForm.videoFps().invalid()) {
+                  <span id="fps-error" class="error">{{ firstError(settingsForm.videoFps) }}</span>
+                }
               </div>
               <div class="field">
                 <label for="print">Print size, longest side (mm)</label>
-                <input id="print" type="number" step="10" [formField]="settingsForm.printSizeMm" />
+                <input
+                  id="print"
+                  type="number"
+                  step="10"
+                  [formField]="settingsForm.printSizeMm"
+                  [attr.aria-invalid]="settingsForm.printSizeMm().invalid()"
+                  [attr.aria-describedby]="
+                    settingsForm.printSizeMm().invalid() ? 'print-error' : null
+                  "
+                />
+                @if (settingsForm.printSizeMm().invalid()) {
+                  <span id="print-error" class="error">{{
+                    firstError(settingsForm.printSizeMm)
+                  }}</span>
+                }
               </div>
               <div class="field">
                 <label for="faces">Target triangles</label>
@@ -179,8 +229,16 @@ const PREVIEW_LIMIT = 48;
                   type="number"
                   step="50000"
                   [formField]="settingsForm.targetFaces"
-                  aria-describedby="faces-hint"
+                  [attr.aria-invalid]="settingsForm.targetFaces().invalid()"
+                  [attr.aria-describedby]="
+                    settingsForm.targetFaces().invalid() ? 'faces-error faces-hint' : 'faces-hint'
+                  "
                 />
+                @if (settingsForm.targetFaces().invalid()) {
+                  <span id="faces-error" class="error">{{
+                    firstError(settingsForm.targetFaces)
+                  }}</span>
+                }
                 <div class="presets" role="group" aria-label="Triangle presets">
                   @for (f of facePresets; track f) {
                     <button
@@ -205,7 +263,9 @@ const PREVIEW_LIMIT = 48;
                 <span class="hint">
                   {{ imageTotal() | number }} images ({{ photoCount() }} photos{{
                     videoCount() ? ' + ' + videoFrameTotal() + ' video frames' : ''
-                  }}{{ sphericalCount() ? ', 360° frames split into ' + panoViews + ' views each' : '' }}).
+                  }}{{
+                    sphericalCount() ? ', 360° frames split into ' + panoViews + ' views each' : ''
+                  }}).
                   {{
                     calibration.value()?.runs
                       ? 'Calibrated from ' +
@@ -215,9 +275,16 @@ const PREVIEW_LIMIT = 48;
                   }}
                 </span>
               </div>
-              @if (settingsForm().invalid()) {
-                <p class="error" role="alert">Check the settings: values are out of range.</p>
-              }
+              <div role="alert">
+                @if (settingsForm().invalid()) {
+                  <p class="error">Fix before starting:</p>
+                  <ul class="error">
+                    @for (e of settingsForm().errorSummary(); track $index) {
+                      <li>{{ e.message }}</li>
+                    }
+                  </ul>
+                }
+              </div>
               <button
                 class="btn primary"
                 type="submit"
@@ -229,8 +296,8 @@ const PREVIEW_LIMIT = 48;
                 <p class="hint muted">Upload photos or a video first.</p>
               } @else if (queueBusy()) {
                 <p class="hint muted">
-                  Another run is in progress{{ busyElsewhere() ? ' in ' + busyElsewhere() : '' }}. Runs
-                  go one at a time, so this one starts when it finishes.
+                  Another run is in progress{{ busyElsewhere() ? ' in ' + busyElsewhere() : '' }}.
+                  Runs go one at a time, so this one starts when it finishes.
                 </p>
               }
             </form>
@@ -509,14 +576,24 @@ export class ProjectPage {
     structuredClone(DEFAULT_SETTINGS[this.kind()]),
   );
   protected readonly settingsForm = form(this.settings, (s) => {
-    required(s.videoFps);
-    min(s.videoFps, 0.1);
-    max(s.videoFps, 10);
-    min(s.printSizeMm, 10);
-    max(s.printSizeMm, 1000);
-    min(s.targetFaces, 10_000);
-    max(s.targetFaces, 5_000_000);
+    range(
+      s.videoFps,
+      0.1,
+      10,
+      (v) => `Video frames per second must be between 0.1 and 10${v}. 1–2 suits most footage.`,
+    );
+    range(s.printSizeMm, 10, 1000, (v) => `Print size must be between 10 and 1,000 mm${v}.`);
+    range(
+      s.targetFaces,
+      10_000,
+      5_000_000,
+      (v) => `Target triangles must be between 10,000 and 5,000,000${v}. Use a preset if unsure.`,
+    );
   });
+
+  protected firstError(field: FieldTree<number>) {
+    return field().errors()[0]?.message ?? '';
+  }
 
   /** The run just started from this page, highlighted until the next one. */
   protected readonly justQueued = signal<number | null>(null);
