@@ -96,8 +96,11 @@ Video-heavy runs try COLMAP's global mapper first, because it places every frame
 checked: neighbouring video frames must sit close together and face roughly the same way. Where the global mapper joined
 pieces in the wrong place (on a drone flight and two deck walkthroughs it produced overlapping, misaligned or mirrored
 copies of the scene), the run falls back to the incremental mapper. That mapper keeps only the largest consistent
-piece, with relaxed thresholds so fast turns break it less often (248 of 324 drone frames instead of 210). The run
-report warns when the kept model still has breaks.
+piece, with relaxed thresholds so fast turns break it less often (248 of 324 drone frames instead of 210).
+
+Where the kept model still loses stretches of a video, usually fast turns, the run samples those moments again at 4×
+the frame rate and maps once more, keeping the result only if it's better. On the drone flight this placed 280 of the
+324 original frames (plus extras), with 128k sparse points instead of 82k. The run report warns about any breaks left.
 
 ## Capture tips
 
