@@ -8,6 +8,7 @@ import {
   DEFAULT_SETTINGS,
   STAGES,
   estimateStageSeconds,
+  isSpherical,
   type Calibration,
   type EstimateInput,
   type Job,
@@ -29,7 +30,7 @@ import {
 } from './db';
 import { pipeline } from './pipeline';
 import { thumbnail } from './thumbnails';
-import { systemStatus, videoDuration } from './tools';
+import { mediaInfo, systemStatus } from './tools';
 
 const IMAGE_EXT = new Set(['.jpg', '.jpeg', '.png', '.tif', '.tiff', '.bmp']);
 const VIDEO_EXT = new Set(['.mp4', '.mov', '.m4v', '.mkv', '.avi', '.webm']);
@@ -59,23 +60,25 @@ const toMedia = (r: MediaRow): Media => ({
   type: r.type,
   size: r.size,
   duration: r.duration && r.duration > 0 ? r.duration : null,
+  spherical: isSpherical(r.width, r.height),
   createdAt: r.created_at,
 });
 
-/** Probes any videos whose length isn't known yet (uploads from before durations were stored). */
-async function fillDurations(projectId?: number) {
+/** Probes pixel size (and video length) of uploads not probed yet, including older uploads. */
+async function fillMediaInfo(projectId?: number) {
   const rows = getDb()
     .prepare(
-      `SELECT * FROM media WHERE type = 'video' AND duration IS NULL` +
+      `SELECT * FROM media WHERE width IS NULL` +
         (projectId === undefined ? '' : ` AND project_id = ${Number(projectId)}`),
     )
     .all() as unknown as MediaRow[];
   for (const m of rows) {
-    const seconds = await videoDuration(join(mediaDir(m.project_id), m.filename));
-    // -1 marks unreadable files so they aren't probed on every request.
+    const info = await mediaInfo(join(mediaDir(m.project_id), m.filename));
+    const duration = m.type === 'video' ? (info.duration ?? -1) : null;
+    // -1 marks unreadable values so files aren't probed on every request.
     getDb()
-      .prepare(`UPDATE media SET duration = ? WHERE id = ?`)
-      .run(seconds ?? -1, m.id);
+      .prepare(`UPDATE media SET duration = ?, width = ?, height = ? WHERE id = ?`)
+      .run(duration, info.width ?? -1, info.height ?? -1, m.id);
   }
 }
 
@@ -219,7 +222,7 @@ export function createApi() {
 
   // --- projects ---
   api.get('/projects', async (_req, res) => {
-    await fillDurations();
+    await fillMediaInfo();
     const rows = getDb()
       .prepare(`SELECT * FROM projects ORDER BY id DESC`)
       .all() as unknown as ProjectRow[];
@@ -241,7 +244,7 @@ export function createApi() {
   });
 
   api.get('/projects/:id', async (req, res) => {
-    await fillDurations(id(req));
+    await fillMediaInfo(id(req));
     const p = getProject(id(req));
     if (!p) return void notFound(res);
     res.json(toProject(p));
@@ -274,7 +277,7 @@ export function createApi() {
 
   // --- media ---
   api.get('/projects/:id/media', async (req, res) => {
-    await fillDurations(id(req));
+    await fillMediaInfo(id(req));
     const rows = getDb()
       .prepare(`SELECT * FROM media WHERE project_id = ? ORDER BY id`)
       .all(id(req)) as unknown as MediaRow[];
@@ -299,7 +302,7 @@ export function createApi() {
             .get(Number(r.lastInsertRowid)) as unknown as MediaRow,
         );
       });
-      await fillDurations(id(req));
+      await fillMediaInfo(id(req));
       res
         .status(201)
         .json(

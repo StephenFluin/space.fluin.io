@@ -20,6 +20,8 @@ import {
   estimatedStlBytes,
   recommendedFaces,
   videoFrames,
+  mediaImages,
+  PANO_VIEWS,
   type JobSettings,
   type ProjectKind,
 } from '../../shared/models';
@@ -94,8 +96,10 @@ const PREVIEW_LIMIT = 48;
                   <li>
                     <div class="thumb">
                       <img [ngSrc]="thumbSrc(m.id)" fill alt="" />
-                      @if (m.type === 'video') {
-                        <span class="video-badge">Video</span>
+                      @if (m.type === 'video' || m.spherical) {
+                        <span class="video-badge">
+                          {{ m.spherical ? '360°' : '' }} {{ m.type === 'video' ? 'Video' : 'Photo' }}
+                        </span>
                       }
                     </div>
                     <span class="name" [title]="m.originalName">{{ m.originalName }}</span>
@@ -103,6 +107,9 @@ const PREVIEW_LIMIT = 48;
                       {{ size(m.size) }}
                       @if (m.duration) {
                         · {{ duration(m.duration) }} · {{ frames(m.duration) }} frames
+                      }
+                      @if (m.spherical) {
+                        × {{ panoViews }} views
                       }
                     </span>
                     <button
@@ -156,7 +163,7 @@ const PREVIEW_LIMIT = 48;
               </div>
               <div class="field">
                 <label for="fps">Video frames per second</label>
-                <input id="fps" type="number" step="0.5" [formField]="settingsForm.videoFps" />
+                <input id="fps" type="number" step="0.25" [formField]="settingsForm.videoFps" />
               </div>
               <div class="field">
                 <label for="print">Print size, longest side (mm)</label>
@@ -195,7 +202,7 @@ const PREVIEW_LIMIT = 48;
                 <span class="hint">
                   {{ imageTotal() | number }} images ({{ photoCount() }} photos{{
                     videoCount() ? ' + ' + videoFrameTotal() + ' video frames' : ''
-                  }}).
+                  }}{{ sphericalCount() ? ', 360° frames split into ' + panoViews + ' views each' : '' }}).
                   {{
                     calibration.value()?.runs
                       ? 'Calibrated from ' +
@@ -213,10 +220,15 @@ const PREVIEW_LIMIT = 48;
                 type="submit"
                 [disabled]="!media.value().length || settingsForm().submitting()"
               >
-                Start reconstruction
+                {{ queueBusy() ? 'Queue reconstruction' : 'Start reconstruction' }}
               </button>
               @if (!media.value().length) {
                 <p class="hint muted">Upload photos or a video first.</p>
+              } @else if (queueBusy()) {
+                <p class="hint muted">
+                  Another run is in progress{{ busyElsewhere() ? ' in ' + busyElsewhere() : '' }}. Runs
+                  go one at a time, so this one starts when it finishes.
+                </p>
               }
             </form>
           </section>
@@ -406,7 +418,13 @@ export class ProjectPage {
   protected readonly videoFrameTotal = computed(() =>
     videoFrames(this.videoSeconds(), this.settings().videoFps),
   );
-  protected readonly imageTotal = computed(() => this.photoCount() + this.videoFrameTotal());
+  protected readonly sphericalCount = computed(
+    () => this.media.value().filter((m) => m.spherical).length,
+  );
+  protected readonly panoViews = PANO_VIEWS;
+  protected readonly imageTotal = computed(() =>
+    this.media.value().reduce((n, m) => n + mediaImages(m, this.settings().videoFps), 0),
+  );
   protected readonly captureSummary = computed(() => {
     const photos = `${this.photoCount()} ${this.photoCount() === 1 ? 'photo' : 'photos'}`;
     const v = this.videoCount();
@@ -467,6 +485,19 @@ export class ProjectPage {
   private readonly hasActiveJob = computed(() =>
     this.jobs.value().some((j) => j.status === 'queued' || j.status === 'running'),
   );
+  /** Runs execute one at a time across all projects, so a run elsewhere also means queueing. */
+  private readonly allProjects = this.api.projects();
+  protected readonly busyElsewhere = computed(
+    () =>
+      this.allProjects
+        .value()
+        .find(
+          (p) =>
+            p.id !== this.id() &&
+            (p.latestJob?.status === 'running' || p.latestJob?.status === 'queued'),
+        )?.name ?? '',
+  );
+  protected readonly queueBusy = computed(() => this.hasActiveJob() || !!this.busyElsewhere());
 
   /** Settings start from the defaults for the project kind and reset when the kind is known. */
   private readonly kind = computed(() => this.project.value()?.kind ?? 'exterior');
@@ -488,6 +519,12 @@ export class ProjectPage {
     effect((onCleanup) => {
       if (!this.hasActiveJob()) return;
       const timer = setInterval(() => this.jobs.reload(), 2000);
+      onCleanup(() => clearInterval(timer));
+    });
+    // Notice when another project's run finishes, so the button goes back to "Start".
+    effect((onCleanup) => {
+      if (!this.busyElsewhere()) return;
+      const timer = setInterval(() => this.allProjects.reload(), 10_000);
       onCleanup(() => clearInterval(timer));
     });
   }

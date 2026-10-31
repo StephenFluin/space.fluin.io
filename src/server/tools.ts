@@ -129,18 +129,35 @@ export const blenderBin = () => process.env['BLENDER_BIN'] ?? 'blender';
 export const ffmpegBin = () => process.env['FFMPEG_BIN'] ?? 'ffmpeg';
 export const ffprobeBin = () => process.env['FFPROBE_BIN'] ?? 'ffprobe';
 
-/** Length of a video in seconds, or null if ffprobe can't read it. */
-export async function videoDuration(path: string): Promise<number | null> {
+export interface MediaInfo {
+  duration: number | null;
+  width: number | null;
+  height: number | null;
+}
+
+/** Pixel size of a photo or video and the length of a video, or nulls if ffprobe can't read it. */
+export async function mediaInfo(path: string): Promise<MediaInfo> {
   try {
     const { stdout } = await run(
       ffprobeBin(),
-      ['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', path],
+      [
+        ...['-v', 'error', '-select_streams', 'v:0', '-of', 'json'],
+        ...['-show_entries', 'format=duration:stream=width,height', path],
+      ],
       { timeout: 30_000 },
     );
-    const seconds = parseFloat(stdout);
-    return Number.isFinite(seconds) ? seconds : null;
+    const info = JSON.parse(stdout) as {
+      format?: { duration?: string };
+      streams?: { width?: number; height?: number }[];
+    };
+    const duration = parseFloat(info.format?.duration ?? '');
+    return {
+      duration: Number.isFinite(duration) ? duration : null,
+      width: info.streams?.[0]?.width ?? null,
+      height: info.streams?.[0]?.height ?? null,
+    };
   } catch {
-    return null;
+    return { duration: null, width: null, height: null };
   }
 }
 

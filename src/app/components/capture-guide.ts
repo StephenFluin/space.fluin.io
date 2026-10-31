@@ -95,6 +95,31 @@ import type { ProjectKind } from '../../shared/models';
         </li>
         <li>You can mix both: a video for coverage plus photos of the details you care about.</li>
       </ul>
+
+      <h3>360° cameras (Insta360 and similar)</h3>
+      <ul>
+        <li>
+          Export from Insta360 Studio or the app as a 360° MP4 or JPG (equirectangular, no
+          reframing). Raw .insv/.insp files aren't stitched yet, so they can't be used directly.
+        </li>
+        <li>
+          Each 360° frame is split into four level views (front, right, back, left), so one frame
+          counts as 4 images.
+        </li>
+        <li>
+          Hold the camera on a stick above your head and walk slowly. The views stop 45° below the
+          horizon, so you stay out of frame; anything below that, including the floor at your feet,
+          is skipped.
+        </li>
+        <li>
+          360° video while walking works far better than a few 360° photos. 3–5 spots per room
+          gives only a rough shape. Photos every one or two steps work if you prefer stills.
+        </li>
+        <li>
+          Each view has only about a quarter of the camera's resolution (about 1,900 px from 8K), so
+          expect softer detail than from a normal camera.
+        </li>
+      </ul>
     </details>
   `,
   styles: `

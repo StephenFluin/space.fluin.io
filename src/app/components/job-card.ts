@@ -11,12 +11,14 @@ import {
 import { DatePipe, DecimalPipe } from '@angular/common';
 import { RouterLink } from '@angular/router';
 import {
+  PANO_VIEWS,
   STAGES,
   calibratedStageSeconds,
   type Calibration,
   type Job,
   type OutputKind,
 } from '../../shared/models';
+import { runAdvice } from '../../shared/advice';
 import { Api, formatBytes, formatDuration, outputUrl, parseTime } from '../api';
 
 const OUTPUT_LABELS: Record<OutputKind, string> = {
@@ -133,6 +135,29 @@ type StepState = 'done' | 'current' | 'failed' | 'pending' | 'skipped';
         </div>
       }
 
+      @if (advice().length) {
+        <details class="report" [open]="initiallyExpanded()">
+          <summary>
+            Run report
+            <span class="muted">
+              · {{ tips() }} {{ tips() === 1 ? 'suggestion' : 'suggestions' }} for next time
+            </span>
+          </summary>
+          <ul>
+            @for (a of advice(); track a.title) {
+              <li [class]="a.tone">
+                <span class="icon" aria-hidden="true">{{ adviceIcons[a.tone] }}</span>
+                <span class="visually-hidden">{{ toneLabels[a.tone] }}:</span>
+                <span>
+                  <strong>{{ a.title }}.</strong>
+                  {{ a.detail }}
+                </span>
+              </li>
+            }
+          </ul>
+        </details>
+      }
+
       @if (expanded()) {
         <div class="body">
           <div>
@@ -163,6 +188,11 @@ type StepState = 'done' | 'current' | 'failed' | 'pending' | 'skipped';
                     <span class="muted">
                       ({{ j.stats.photos }} photos + {{ j.stats.videoFrames | number }} frames from
                       {{ j.stats.videos }} {{ j.stats.videos === 1 ? 'video' : 'videos' }})
+                    </span>
+                  }
+                  @if (j.stats.spherical) {
+                    <span class="muted">
+                      · each 360° frame split into {{ panoViews }} views
                     </span>
                   }
                 </dd>
@@ -305,6 +335,45 @@ type StepState = 'done' | 'current' | 'failed' | 'pending' | 'skipped';
       gap: 0.5rem;
       flex-wrap: wrap;
     }
+    .report {
+      margin-top: 0.75rem;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 0.5rem 0.75rem;
+    }
+    .report summary {
+      cursor: pointer;
+      font-weight: 600;
+    }
+    .report summary .muted {
+      font-weight: 400;
+    }
+    .report ul {
+      list-style: none;
+      padding: 0;
+      margin: 0.5rem 0 0.25rem;
+      display: grid;
+      gap: 0.5rem;
+    }
+    .report li {
+      display: grid;
+      grid-template-columns: 1.25rem 1fr;
+      gap: 0.4rem;
+      line-height: 1.45;
+    }
+    .report .icon {
+      font-weight: 700;
+      text-align: center;
+    }
+    .report .good .icon {
+      color: var(--ok);
+    }
+    .report .warn .icon {
+      color: var(--warn);
+    }
+    .report .tip .icon {
+      color: var(--accent);
+    }
     .download .muted {
       font-weight: 400;
       font-size: 0.8rem;
@@ -389,6 +458,7 @@ type StepState = 'done' | 'current' | 'failed' | 'pending' | 'skipped';
   `,
 })
 export class JobCard {
+  protected readonly panoViews = PANO_VIEWS;
   private readonly api = inject(Api);
   readonly job = input.required<Job>();
   /** The newest run starts expanded; older runs collapse to a summary. */
@@ -415,6 +485,13 @@ export class JobCard {
   private readonly now = signal(Date.now());
 
   protected readonly active = computed(() => ['queued', 'running'].includes(this.job().status));
+  /** Post-run advice; only for runs that got far enough to measure something. */
+  protected readonly advice = computed(() =>
+    this.job().status === 'done' || this.job().status === 'failed' ? runAdvice(this.job()) : [],
+  );
+  protected readonly tips = computed(() => this.advice().filter((a) => a.tone !== 'good').length);
+  protected readonly adviceIcons = { good: '✓', warn: '!', tip: '→' } as const;
+  protected readonly toneLabels = { good: 'Good', warn: 'Problem', tip: 'Suggestion' } as const;
   protected readonly hasGlb = computed(() => this.job().outputs.some((o) => o.kind === 'glb'));
   protected readonly statusLabel = computed(() => STATUS_LABELS[this.job().status]);
   protected readonly qualityLabel = computed(() => {

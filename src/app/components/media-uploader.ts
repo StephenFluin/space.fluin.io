@@ -3,6 +3,11 @@ import { DecimalPipe } from '@angular/common';
 import { Api } from '../api';
 
 const ACCEPT = '.jpg,.jpeg,.png,.tif,.tiff,.bmp,.mp4,.mov,.m4v,.mkv,.avi,.webm';
+/** Insta360 originals hold two unstitched fisheye images; the app needs the stitched 360° export. */
+const RAW_360 = ['.insv', '.insp', '.lrv'];
+const RAW_360_HELP =
+  'Insta360 .insv/.insp files are unstitched originals. Export them from Insta360 Studio or the ' +
+  'app as a 360° MP4 or JPG (no reframing), then upload the export.';
 
 /** Drag-and-drop / file-picker upload of photos and videos into a project. */
 @Component({
@@ -118,9 +123,10 @@ export class MediaUploader {
     const exts = ACCEPT.split(',');
     const ok = files.filter((f) => exts.some((x) => f.name.toLowerCase().endsWith(x)));
     const skipped = files.length - ok.length;
+    const raw = files.some((f) => RAW_360.some((x) => f.name.toLowerCase().endsWith(x)));
     if (!ok.length) {
       this.failed.set(true);
-      this.message.set('None of those files are supported photos or videos.');
+      this.message.set(raw ? RAW_360_HELP : 'None of those files are supported photos or videos.');
       return;
     }
     this.uploading.set(true);
@@ -135,7 +141,8 @@ export class MediaUploader {
         this.failed.set(false);
         this.message.set(
           `Uploaded ${e.done.length} files.` +
-            (skipped ? ` Skipped ${skipped} unsupported files.` : ''),
+            (skipped ? ` Skipped ${skipped} unsupported files.` : '') +
+            (raw ? ` ${RAW_360_HELP}` : ''),
         );
         this.uploaded.emit();
       },

@@ -32,11 +32,26 @@ export interface Media {
   size: number;
   /** Video length in seconds; null for photos or when it could not be read. */
   duration: number | null;
+  /** Equirectangular 360° photo or video (2:1), split into PANO_VIEWS level views per frame. */
+  spherical: boolean;
   createdAt: string;
 }
 
+/** Level 90° views cut from each 360° frame (front, right, back, left). */
+export const PANO_VIEWS = 4;
+
+/** Equirectangular panoramas are exactly 2:1; phone "panorama" shots are much wider. */
+export const isSpherical = (width: number | null, height: number | null) =>
+  !!width && !!height && width >= 2000 && Math.abs(width / height - 2) < 0.01;
+
 /** Frames the pipeline will sample from `seconds` of video at `fps`. */
 export const videoFrames = (seconds: number, fps: number) => Math.round(seconds * fps);
+
+/** Images COLMAP will see for one upload: 360° frames count once per view. */
+export function mediaImages(m: Pick<Media, 'type' | 'duration' | 'spherical'>, fps: number) {
+  const frames = m.type === 'video' ? videoFrames(m.duration ?? 0, fps) : 1;
+  return frames * (m.spherical ? PANO_VIEWS : 1);
+}
 
 export interface JobSettings {
   quality: Quality;
@@ -77,12 +92,24 @@ export interface StageTiming {
   interrupted?: boolean;
 }
 
+/** Frame gaps the sequential matcher tries, and so the gaps we can measure overlap at. */
+export const MATCH_GAPS = [1, 2, 4, 8];
+
+export interface GapMatches {
+  gap: number;
+  /** Median and 20th-percentile verified matches between frames `gap` apart. */
+  median: number;
+  low: number;
+}
+
 /** Facts gathered while a run progresses; every field appears once its step has run. */
 export interface JobStats {
   images?: number;
   photos?: number;
   videos?: number;
   videoFrames?: number;
+  /** 360° photos and videos in the run; each of their frames became PANO_VIEWS views. */
+  spherical?: number;
   gpu?: boolean;
   /** Source views per depth map used for dense stereo. */
   denseSources?: number;
@@ -93,6 +120,16 @@ export interface JobStats {
   meshFaces?: number;
   printableFaces?: number;
   dimensionsMm?: [number, number, number];
+  /** Widest input image in pixels (a 360° view counts at its view size). */
+  sourceWidth?: number;
+  /** Separate models the mapper produced; only the largest is used. */
+  models?: number;
+  /** Average number of images each sparse point was seen in. */
+  trackLength?: number;
+  /** Verified matches between video frames 1, 2, 4 and 8 apart. */
+  matchesByGap?: GapMatches[];
+  /** Triangles in COLMAP's mesh before Blender decimated it to the target. */
+  rawMeshFaces?: number;
 }
 
 export interface JobOutput {

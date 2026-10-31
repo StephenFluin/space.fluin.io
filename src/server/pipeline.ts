@@ -12,14 +12,19 @@ import {
   writeFile,
 } from 'node:fs/promises';
 import { join, parse } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import {
   DENSE_SIZE,
   DENSE_SOURCES,
+  PANO_VIEWS,
   STAGES,
+  isSpherical,
   useSequentialMatching,
   type JobOutput,
   type JobSettings,
   type EstimateInput,
+  MATCH_GAPS,
+  type GapMatches,
   type JobStats,
   type OutputKind,
   type StageName,
@@ -277,6 +282,7 @@ class Pipeline {
     const denseDir = join(dir, 'dense');
     const fused = join(denseDir, 'fused.ply');
     const rawMesh = join(dir, 'mesh.ply');
+    const rigConfig = join(dir, 'rigs.json');
     const outDir = join(dir, 'output');
     const size = String(DENSE_SIZE[settings.quality]);
     /** The aligned model if alignment succeeded, else the largest sparse model. */
@@ -289,13 +295,32 @@ class Pipeline {
         await rm(imagesDir, { recursive: true, force: true });
         const photosDir = join(imagesDir, 'photos');
         await mkdir(photosDir, { recursive: true });
-        for (const m of photos) {
+        const ffmpeg: Command = { bin: ffmpegBin(), args: [] };
+        const rigs: PanoRig[] = [];
+        for (const m of photos.filter((p) => isSpherical(p.width, p.height))) {
+          // 360° photos of the same size share one rig, so each photo becomes one rig frame.
+          const prefix = `pano-photos-${m.width}`;
+          const size = panoViewSize(m.width!);
+          if (!rigs.some((g) => g.prefix === prefix)) rigs.push({ prefix, size });
+          const input = join(mediaDir(job.project_id), m.filename);
+          await splitPanorama(ffmpeg, exec, input, join(imagesDir, prefix), size, `${m.id}.jpg`);
+        }
+        for (const m of photos.filter((p) => !isSpherical(p.width, p.height))) {
           const from = join(mediaDir(job.project_id), m.filename);
           const to = join(photosDir, m.filename);
           await link(from, to).catch(() => copyFile(from, to));
         }
-        const ffmpeg: Command = { bin: ffmpegBin(), args: [] };
         for (const [i, v] of videos.entries()) {
+          if (isSpherical(v.width, v.height)) {
+            const prefix = `pano-${v.id}`;
+            const size = panoViewSize(v.width!);
+            rigs.push({ prefix, size });
+            const input = join(mediaDir(job.project_id), v.filename);
+            const out = join(imagesDir, prefix);
+            await splitPanorama(ffmpeg, exec, input, out, size, 'frame-%05d.jpg', settings.videoFps);
+            setFraction((i + 1) / videos.length);
+            continue;
+          }
           // One folder per video so COLMAP gives each clip its own camera intrinsics.
           const out = join(imagesDir, `video-${v.id}`);
           await mkdir(out, { recursive: true });
@@ -313,14 +338,23 @@ class Pipeline {
           ]);
           setFraction((i + 1) / videos.length);
         }
-        if (photos.length === 0) await rm(photosDir, { recursive: true });
+        if ((await readdir(photosDir)).length === 0) await rm(photosDir, { recursive: true });
+        await writeFile(rigConfig, JSON.stringify(rigs.map(panoRigConfig), null, 2));
         const imageCount = await countFiles(imagesDir);
         log.write(`${imageCount} images (${photos.length} photos, ${videos.length} videos)\n`);
         addStats({
           images: imageCount,
           photos: photos.length,
           videos: videos.length,
-          videoFrames: imageCount - photos.length,
+          videoFrames: await videoFrameCount(imagesDir),
+          spherical: [...photos, ...videos].filter((m) => isSpherical(m.width, m.height)).length,
+          sourceWidth: Math.max(
+            0,
+            ...rigs.map((g) => g.size),
+            ...[...photos, ...videos]
+              .filter((m) => !isSpherical(m.width, m.height) && m.width && m.width > 0)
+              .map((m) => Math.min(m.width!, m.type === 'video' ? 3840 : Infinity)),
+          ) || undefined,
         });
         if (imageCount < 3) throw new Error('Need at least 3 images (or a video) to reconstruct');
       });
@@ -334,6 +368,10 @@ class Pipeline {
       if (!colmap.gpu) {
         log.write('No GPU available to COLMAP: extracting and matching features on the CPU\n');
       }
+
+      const pano = existsSync(rigConfig) && JSON.parse(await readFile(rigConfig, 'utf8')).length > 0;
+      // 360° views have exact intrinsics from ffmpeg; refine focal lengths only for real cameras.
+      const allPano = pano && media.every((m) => isSpherical(m.width, m.height));
 
       // 2. Features + matching. Both skip images/pairs already in the database when resumed.
       await step('Extracting features', async (resumed) => {
@@ -352,6 +390,12 @@ class Pipeline {
           ],
           { progress: true },
         );
+        // 360° views: tell COLMAP each frame's views share one centre at known rotations.
+        if (pano) {
+          await exec(colmap, [
+            ...['rig_configurator', '--database_path', db_, '--rig_config_path', rigConfig],
+          ]);
+        }
       });
 
       await step('Matching features', async () => {
@@ -364,9 +408,13 @@ class Pipeline {
             '--database_path',
             db_,
             ...cpu.match,
+            // The 360° views don't overlap each other, so pairs within one frame never match.
+            ...(pano ? ['--FeatureMatching.skip_image_pairs_in_same_frame', '1'] : []),
           ],
           { progress: true },
         );
+        const gaps = matchesByGap(db_);
+        if (gaps) addStats({ matchesByGap: gaps });
       });
 
       // 3. Structure from motion.
@@ -379,7 +427,11 @@ class Pipeline {
         let mapped = false;
         if (useSequentialMatching(imageCount, photos.length, videos.length)) {
           try {
-            await exec(colmap, ['global_mapper', ...args]);
+            const fixed = [
+              ...(pano ? ['--GlobalMapper.refine_sensor_from_rig', '0'] : []),
+              ...(allPano ? ['--GlobalMapper.ba_refine_focal_length', '0'] : []),
+            ];
+            await exec(colmap, ['global_mapper', ...args, ...fixed]);
             mapped = (await largestModel(sparseDir)) !== null;
           } catch {
             log.write('Global mapper failed, falling back to incremental mapping.\n');
@@ -389,7 +441,11 @@ class Pipeline {
             await mkdir(sparseDir, { recursive: true });
           }
         }
-        if (!mapped) await exec(colmap, ['mapper', ...args], { progress: true });
+        const fixed = [
+          ...(pano ? ['--Mapper.ba_refine_sensor_from_rig', '0'] : []),
+          ...(allPano ? ['--Mapper.ba_refine_focal_length', '0'] : []),
+        ];
+        if (!mapped) await exec(colmap, ['mapper', ...args, ...fixed], { progress: true });
         const sparse = await largestModel(sparseDir);
         if (!sparse) {
           throw new Error(
@@ -397,6 +453,7 @@ class Pipeline {
           );
         }
         addStats(await this.analyzeModel(colmap, sparse));
+        addStats({ models: await countModels(sparseDir) });
       });
 
       // 4. Gravity alignment so models come out upright. Best effort: unaligned models still mesh fine.
@@ -414,6 +471,9 @@ class Pipeline {
             alignedDir,
             '--max_image_size',
             '1024',
+            // 360° views are level by construction (cameras level the horizon with their gyro),
+            // which pins gravity exactly; elsewhere, vanishing lines of walls and edges do.
+            ...(pano ? ['--method', 'IMAGE-ORIENTATION'] : []),
           ]);
         } catch (err) {
           if (err instanceof Cancelled) throw err;
@@ -518,6 +578,8 @@ class Pipeline {
             project.kind === 'exterior' ? '7' : '5',
           ]);
         }
+        const rawMeshFaces = await plyVertexCount(rawMesh, 'face');
+        if (rawMeshFaces !== null) addStats({ rawMeshFaces });
       });
 
       // 7. Blender: clean, orient, scale, and export STL/GLB/.blend.
@@ -574,6 +636,7 @@ class Pipeline {
       return m ? Number(m[1]) : undefined;
     };
     return {
+      trackLength: num(/Mean track length: ([\d.]+)/),
       registeredImages: num(/Registered images: (\d+)/),
       sparsePoints: num(/Points: (\d+)/),
       reprojectionError: num(/Mean reprojection error: ([\d.]+)/),
@@ -641,7 +704,137 @@ class Pipeline {
 }
 
 /** Reads the vertex count from a PLY header without loading the file. */
-async function plyVertexCount(path: string): Promise<number | null> {
+interface PanoRig {
+  /** Folder under images/ holding v0…v3 view folders. */
+  prefix: string;
+  /** Width and height of each square 90° view. */
+  size: number;
+}
+
+/** A 90° view spans a quarter of the panorama's width; cap it to keep dense stereo affordable. */
+const panoViewSize = (width: number) => Math.min(2400, Math.floor(width / PANO_VIEWS / 2) * 2);
+
+/** Yaw of view `i` in degrees, clockwise seen from above, within ffmpeg's −180…180 range. */
+const panoYaw = (i: number) => (((360 / PANO_VIEWS) * i + 180) % 360) - 180;
+
+/**
+ * Cuts each 360° frame into PANO_VIEWS level 90° pinhole views (`<out>/v<i>/<name>`), like COLMAP's
+ * non-overlapping panorama rig. Views stop 45° below the horizon, so someone holding the camera
+ * overhead on a stick stays out of frame.
+ */
+async function splitPanorama(
+  ffmpeg: Command,
+  exec: (cmd: Command, args: string[]) => Promise<unknown>,
+  input: string,
+  out: string,
+  size: number,
+  name: string,
+  fps?: number,
+) {
+  const views = Array.from({ length: PANO_VIEWS }, (_, i) => i);
+  for (const i of views) await mkdir(join(out, `v${i}`), { recursive: true });
+  const graph =
+    `[0:v]${fps ? `fps=${fps},` : ''}split=${PANO_VIEWS}${views.map((i) => `[s${i}]`).join('')};` +
+    views
+      .map(
+        (i) =>
+          `[s${i}]v360=input=e:output=flat:yaw=${panoYaw(i)}:h_fov=90:v_fov=90` +
+          `:w=${size}:h=${size}:interp=cubic[v${i}]`,
+      )
+      .join(';');
+  await exec(ffmpeg, [
+    ...['-hide_banner', '-loglevel', 'error', '-i', input, '-filter_complex', graph],
+    ...views.flatMap((i) => [
+      ...['-map', `[v${i}]`, '-qscale:v', '2'],
+      ...(fps ? [] : ['-frames:v', '1', '-update', '1']),
+      join(out, `v${i}`, name),
+    ]),
+  ]);
+}
+
+/** COLMAP rig_configurator entry: view 0 is the reference; the rest are pure yaw rotations. */
+function panoRigConfig(rig: PanoRig) {
+  const f = rig.size / 2; // 90° field of view
+  // One focal length, not PINHOLE's fx/fy: with every camera at one height, bundle adjustment
+  // can otherwise trade fy against vertical scale and stretch rooms ~2× taller (seen in testing).
+  const camera = { camera_model_name: 'SIMPLE_PINHOLE', camera_params: [f, rig.size / 2, rig.size / 2] };
+  return {
+    cameras: Array.from({ length: PANO_VIEWS }, (_, i) => {
+      const prefix = { image_prefix: `${rig.prefix}/v${i}/`, ...camera };
+      if (i === 0) return { ...prefix, ref_sensor: true };
+      // cam_from_rig is a rotation of -yaw about the camera's (downward) y axis, as [w, x, y, z].
+      const half = (panoYaw(i) * Math.PI) / 360;
+      return {
+        ...prefix,
+        cam_from_rig_rotation: [Math.cos(half), 0, -Math.sin(half), 0],
+        cam_from_rig_translation: [0, 0, 0],
+      };
+    }),
+  };
+}
+
+/**
+ * Verified matches between video frames 1, 2, 4 and 8 apart (the gaps COLMAP's sequential matcher
+ * tries). If frames several apart still match strongly, the video was sampled more densely than
+ * needed; weak neighbours mean it was sampled too sparsely.
+ */
+function matchesByGap(databasePath: string): GapMatches[] | undefined {
+  const db = new DatabaseSync(databasePath, { readOnly: true });
+  try {
+    const frames = new Map<number, { folder: string; index: number }>();
+    for (const r of db.prepare(`SELECT image_id, name FROM images`).all() as {
+      image_id: number;
+      name: string;
+    }[]) {
+      const m = r.name.match(/^(.*)\/frame-(\d+)\.jpg$/);
+      if (m) frames.set(r.image_id, { folder: m[1], index: Number(m[2]) });
+    }
+    const byGap = new Map<number, number[]>(MATCH_GAPS.map((g) => [g, []]));
+    const pairs = db.prepare(`SELECT pair_id, rows FROM two_view_geometries`).all() as {
+      pair_id: number | bigint;
+      rows: number;
+    }[];
+    for (const { pair_id, rows } of pairs) {
+      const id = BigInt(pair_id);
+      const a = frames.get(Number(id / 2147483647n));
+      const b = frames.get(Number(id % 2147483647n));
+      if (a && b && a.folder === b.folder) byGap.get(Math.abs(a.index - b.index))?.push(rows);
+    }
+    const result = [...byGap]
+      .filter(([, list]) => list.length >= 5)
+      .map(([gap, list]) => {
+        const sorted = list.sort((x, y) => x - y);
+        const at = (q: number) => sorted[Math.floor((sorted.length - 1) * q)];
+        return { gap, median: at(0.5), low: at(0.2) };
+      });
+    return result.length ? result : undefined;
+  } catch {
+    return undefined;
+  } finally {
+    db.close();
+  }
+}
+
+async function countModels(sparseDir: string) {
+  let n = 0;
+  for (const name of await readdir(sparseDir)) {
+    if (existsSync(join(sparseDir, name, 'images.bin'))) n++;
+  }
+  return n;
+}
+
+/** Frames sampled from videos, counting each 360° frame once rather than per view. */
+async function videoFrameCount(imagesDir: string) {
+  let n = 0;
+  for (const name of await readdir(imagesDir)) {
+    if (name.startsWith('video-')) n += await countFiles(join(imagesDir, name));
+    else if (/^pano-\d+$/.test(name)) n += await countFiles(join(imagesDir, name, 'v0'));
+  }
+  return n;
+}
+
+/** Vertex count (or another element's count) from a PLY header. */
+async function plyVertexCount(path: string, element = 'vertex'): Promise<number | null> {
   try {
     const fh = await open(path, 'r');
     try {
@@ -650,7 +843,7 @@ async function plyVertexCount(path: string): Promise<number | null> {
       const m = buf
         .subarray(0, bytesRead)
         .toString('latin1')
-        .match(/element vertex (\d+)/);
+        .match(new RegExp(`element ${element} (\\d+)`));
       return m ? Number(m[1]) : null;
     } finally {
       await fh.close();

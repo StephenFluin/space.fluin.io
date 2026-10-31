@@ -41,6 +41,10 @@ function migrate(db: DatabaseSync) {
     (c) => c.name,
   );
   if (!mediaColumns.includes('duration')) db.exec(`ALTER TABLE media ADD COLUMN duration REAL`);
+  if (!mediaColumns.includes('width')) {
+    db.exec(`ALTER TABLE media ADD COLUMN width INTEGER`);
+    db.exec(`ALTER TABLE media ADD COLUMN height INTEGER`);
+  }
   if (!jobColumns.includes('attempts')) {
     db.exec(`ALTER TABLE jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0`);
   }
@@ -201,6 +205,8 @@ export interface MediaRow {
   type: 'image' | 'video';
   size: number;
   duration: number | null;
+  width: number | null;
+  height: number | null;
   created_at: string;
 }
 

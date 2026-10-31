@@ -104,6 +104,26 @@ The project page has a fuller guide ("How to shoot … that reconstruct well") n
   spot. Plain walls need furniture or trim in frame to match.
 - Upload JPEG/PNG/TIFF with EXIF intact (convert HEIC first) and MP4/MOV video.
 
+## 360° cameras
+
+Equirectangular (2:1) photos and videos, such as Insta360 exports, are detected automatically. Each frame is cut into
+four level 90° views with ffmpeg's `v360` filter (front, right, back, left), the same layout as COLMAP's
+non-overlapping panorama rig. `rig_configurator` then tells COLMAP that the four views share one centre at known
+rotations, and pairs within one frame are skipped during matching. The views stop 45° below the horizon, so a person
+holding the camera overhead on a stick stays out of frame. Raw `.insv`/`.insp` files are rejected with a prompt to
+export a stitched 360° file first.
+
+## Run report
+
+A finished run's card has a report built from its statistics (`src/shared/advice.ts`). It covers:
+
+- how many images were placed, and why some might not have been;
+- whether video frames were too sparse, or so dense that a lower frame rate would do, measured from verified matches
+  between frames 1, 2, 4 and 8 apart;
+- whether triangles, dense resolution or the capture limited detail;
+- blur, judged from reprojection error;
+- where the time went.
+
 ## 3D explorer
 
 First-person **walk** mode (the default) or orbit. Walk uses WASD/arrows, Space to rise, C to sink (E/Q also work),
