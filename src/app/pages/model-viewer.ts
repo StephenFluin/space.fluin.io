@@ -20,6 +20,8 @@ const MOVE_KEYS = new Set([
   'KeyD',
   'KeyQ',
   'KeyE',
+  'KeyC',
+  'Space',
   'ArrowUp',
   'ArrowDown',
   'ArrowLeft',
@@ -52,7 +54,11 @@ export class ModelViewer {
   private originals = new Map<THREE.Mesh, THREE.Material | THREE.Material[]>();
   private model?: THREE.Object3D;
   private bounds = new THREE.Box3();
-  private mode: ViewerMode = 'orbit';
+  /** Robust interior start point: median position at eye height between floor and ceiling. */
+  private inside = new THREE.Vector3();
+  private mode: ViewerMode = 'walk';
+  private interior = false;
+  private speed = 1;
   private colours = true;
   private wireframe = false;
   private cut = 1;
@@ -60,7 +66,10 @@ export class ModelViewer {
 
   constructor(
     private readonly canvas: HTMLCanvasElement,
-    private readonly events: { onLock: (locked: boolean) => void },
+    private readonly events: {
+      onLock: (locked: boolean) => void;
+      onSpeed: (multiplier: number) => void;
+    },
   ) {
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
     this.renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
@@ -76,11 +85,13 @@ export class ModelViewer {
     this.orbit = new OrbitControls(this.camera, canvas);
     this.orbit.enableDamping = true;
     this.orbit.listenToKeyEvents(canvas);
+    this.orbit.enabled = false;
 
     this.walk = new PointerLockControls(this.camera, canvas);
     this.walk.addEventListener('lock', () => this.events.onLock(true));
     this.walk.addEventListener('unlock', () => this.events.onLock(false));
     canvas.addEventListener('click', this.onCanvasClick);
+    canvas.addEventListener('wheel', this.onWheel, { passive: false });
 
     this.resize = new ResizeObserver(() => this.fit());
     this.resize.observe(canvas);
@@ -129,17 +140,20 @@ export class ModelViewer {
     if (mode === 'orbit') {
       this.walk.unlock();
       this.resetCamera();
+    } else if (this.interior) {
+      this.camera.position.copy(this.inside);
+      this.camera.lookAt(this.inside.x + 1, this.inside.y, this.inside.z);
     } else {
-      // Drop to roughly eye height for a 2.5 m room, scaled to the model.
-      const size = this.bounds.getSize(new THREE.Vector3());
-      const centre = this.bounds.getCenter(new THREE.Vector3());
-      this.camera.position.set(
-        centre.x,
-        this.bounds.min.y + Math.min(size.y * 0.6, size.y - 0.01),
-        centre.z,
-      );
-      this.camera.lookAt(centre.x + 1, this.camera.position.y, centre.z);
+      // Exteriors: start where orbit would, outside and looking at the building, then fly in.
+      this.orbitPose();
     }
+  }
+
+  /** Interiors start walk mode inside the room; exteriors start outside looking in. */
+  setInterior(on: boolean) {
+    if (on === this.interior) return;
+    this.interior = on;
+    if (this.mode === 'walk') this.resetCamera();
   }
 
   setColours(on: boolean) {
@@ -183,16 +197,27 @@ export class ModelViewer {
       this.setMode('walk');
       return;
     }
+    this.orbitPose();
+  }
+
+  private orbitPose() {
+    const size = this.bounds.getSize(new THREE.Vector3()).length() || 1;
+    const centre = this.bounds.getCenter(new THREE.Vector3());
     this.camera.position
       .copy(centre)
       .add(new THREE.Vector3(0.6, 0.5, 0.8).multiplyScalar(size * 0.9));
     this.orbit.target.copy(centre);
     this.orbit.update();
+    this.camera.lookAt(centre);
   }
 
   key(e: KeyboardEvent, down: boolean) {
     if (this.mode !== 'walk' || !MOVE_KEYS.has(e.code)) return;
-    if ((e.target as HTMLElement | null)?.closest('input, select, textarea')) return;
+    // Leave Space and friends to focused controls (buttons, sliders) unless the mouse is captured.
+    const target = e.target as HTMLElement | null;
+    if (!this.walk.isLocked && target?.closest('input, select, textarea, button, a')) return;
+    // Ctrl is deliberately unused: Ctrl+W (descend while moving forward) would close the tab.
+    if (e.ctrlKey || e.metaKey) return;
     e.preventDefault();
     if (down) this.keys.add(e.code);
     else this.keys.delete(e.code);
@@ -202,6 +227,7 @@ export class ModelViewer {
     cancelAnimationFrame(this.frame);
     this.resize.disconnect();
     this.canvas.removeEventListener('click', this.onCanvasClick);
+    this.canvas.removeEventListener('wheel', this.onWheel);
     this.orbit.dispose();
     this.walk.dispose();
     this.scene.traverse((o) => {
@@ -218,6 +244,15 @@ export class ModelViewer {
     if (this.mode === 'walk') this.walk.lock();
   };
 
+  /** Scroll adjusts walking speed, as in Unity's and Unreal's fly cameras. */
+  private readonly onWheel = (e: WheelEvent) => {
+    if (this.mode !== 'walk') return;
+    e.preventDefault();
+    const next = this.speed * (e.deltaY < 0 ? 1.25 : 0.8);
+    this.speed = Math.min(16, Math.max(1 / 16, next));
+    this.events.onSpeed(this.speed);
+  };
+
   /** Centre the model on the origin, sitting on the grid. */
   private ground() {
     if (!this.model) return;
@@ -228,10 +263,41 @@ export class ModelViewer {
     this.pivot.position.set(-centre.x, -box.min.y, -centre.z);
     this.pivot.updateMatrixWorld(true);
     this.bounds.setFromObject(this.pivot);
+    this.findInside();
     const size = this.bounds.getSize(new THREE.Vector3());
     const span = Math.max(size.x, size.z) * 1.4;
     this.grid.scale.setScalar(span);
     this.updateCut();
+  }
+
+  /**
+   * Bounding boxes are stretched by stray noise, so their centre can sit outside the room. Use the
+   * median of the geometry instead, at 60% of the way from floor (5th percentile) to ceiling (95th).
+   */
+  private findInside() {
+    const xs: number[] = [];
+    const ys: number[] = [];
+    const zs: number[] = [];
+    const v = new THREE.Vector3();
+    this.model?.traverse((o) => {
+      if (!(o instanceof THREE.Mesh)) return;
+      const pos = (o.geometry as THREE.BufferGeometry).attributes['position'];
+      const step = Math.max(1, Math.floor(pos.count / 20_000));
+      for (let i = 0; i < pos.count; i += step) {
+        v.fromBufferAttribute(pos, i).applyMatrix4(o.matrixWorld);
+        xs.push(v.x);
+        ys.push(v.y);
+        zs.push(v.z);
+      }
+    });
+    if (!xs.length) {
+      this.bounds.getCenter(this.inside);
+      return;
+    }
+    const at = (a: number[], q: number) => a.sort((m, n) => m - n)[Math.floor((a.length - 1) * q)];
+    const floor = at(ys, 0.05);
+    const ceiling = at(ys, 0.95);
+    this.inside.set(at(xs, 0.5), floor + (ceiling - floor) * 0.6, at(zs, 0.5));
   }
 
   private updateCut() {
@@ -269,7 +335,7 @@ export class ModelViewer {
     if (!this.keys.size) return;
     const size = this.bounds.getSize(new THREE.Vector3());
     const fast = this.keys.has('ShiftLeft') || this.keys.has('ShiftRight');
-    const speed = Math.max(size.x, size.z) * 0.12 * (fast ? 3 : 1) * dt;
+    const speed = Math.max(size.x, size.z) * 0.12 * this.speed * (fast ? 3 : 1) * dt;
     const k = (c: string) => (this.keys.has(c) ? 1 : 0);
     const forward = k('KeyW') + k('ArrowUp') - k('KeyS') - k('ArrowDown');
     const right = k('KeyD') - k('KeyA');
@@ -277,6 +343,7 @@ export class ModelViewer {
     if (forward) this.walk.moveForward(forward * speed);
     if (right) this.walk.moveRight(right * speed);
     if (turn) this.camera.rotateOnWorldAxis(new THREE.Vector3(0, 1, 0), -turn * 1.5 * dt);
-    this.camera.position.y += (k('KeyE') - k('KeyQ')) * speed;
+    const up = k('Space') + k('KeyE') - k('KeyC') - k('KeyQ');
+    this.camera.position.y += up * speed;
   }
 }

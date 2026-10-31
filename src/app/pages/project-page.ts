@@ -26,6 +26,7 @@ import {
 import { Api, formatBytes, formatDuration, thumbUrl } from '../api';
 import { JobCard } from '../components/job-card';
 import { MediaUploader } from '../components/media-uploader';
+import { CaptureGuide } from '../components/capture-guide';
 import { ProjectTitle } from '../components/project-title';
 
 const PREVIEW_LIMIT = 48;
@@ -40,6 +41,7 @@ const PREVIEW_LIMIT = 48;
     JobCard,
     MediaUploader,
     ProjectTitle,
+    CaptureGuide,
   ],
   template: `
     <div class="page">
@@ -84,46 +86,7 @@ const PREVIEW_LIMIT = 48;
               Capture
               <span class="muted count">{{ captureSummary() }} · {{ totalSize() }}</span>
             </h2>
-            <details class="tips">
-              <summary>
-                Capture tips for {{ p.kind === 'exterior' ? 'drone exteriors' : 'interiors' }}
-              </summary>
-              @if (p.kind === 'exterior') {
-                <ul>
-                  <li>
-                    Fly 2–3 orbits at different heights (e.g. 45° and 70° gimbal pitch), plus a
-                    top-down grid for the roof.
-                  </li>
-                  <li>
-                    Keep 70–80% overlap between photos. In video, fly slowly; 1 fps sampling is
-                    usually plenty.
-                  </li>
-                  <li>
-                    Shoot in overcast light to avoid hard shadows and blown highlights. Lock
-                    exposure if you can.
-                  </li>
-                </ul>
-              } @else {
-                <ul>
-                  <li>
-                    Walk slowly along the walls, pointing the camera across the room; don't pivot on
-                    the spot.
-                  </li>
-                  <li>
-                    Turn on every light. Plain walls lack texture, so include furniture and trim in
-                    each frame.
-                  </li>
-                  <li>
-                    Film through doorways when moving between rooms so the rooms link up into one
-                    model.
-                  </li>
-                  <li>
-                    Avoid mirrors, windows straight into the sun, and people or pets moving through
-                    the shot.
-                  </li>
-                </ul>
-              }
-            </details>
+            <app-capture-guide [kind]="p.kind" />
             <app-media-uploader [projectId]="id()" (uploaded)="refreshMedia()" />
             @if (media.value().length) {
               <ul class="media" aria-label="Uploaded files">
@@ -332,13 +295,6 @@ const PREVIEW_LIMIT = 48;
     .count {
       font-size: 0.9rem;
       font-weight: 400;
-    }
-    .tips {
-      margin-bottom: 1rem;
-    }
-    .tips summary {
-      cursor: pointer;
-      font-weight: 600;
     }
     .media {
       list-style: none;

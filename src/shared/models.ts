@@ -183,7 +183,7 @@ export function estimateStageSeconds(i: EstimateInput): Record<StageName, number
     'Preparing images': 1 + 0.1 * (n - i.photos),
     'Extracting features': 5 + 0.1 * n,
     'Matching features': 5 + 0.02 * pairs,
-    'Sparse reconstruction': 5 + 0.1 * n * Math.max(1, n / 150),
+    'Sparse reconstruction': 5 + 0.003 * n * n,
     'Aligning orientation': 4 + 0.02 * n,
     'Undistorting images': 2 + 0.02 * n * mp,
     // Two passes (photometric + geometric) over every view, each matched against `sources` views.

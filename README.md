@@ -13,7 +13,8 @@ videos ─┴─ ffmpeg frame sampling ──► features ► matching ► spars
                                      ► undistort ► PatchMatch stereo ► fusion ► Poisson / Delaunay mesh
                                                                                      │
                      Blender (headless) ◄────────────────────────────────────────────┘
-                     remove noise islands, orient Z-up, scale to print size, decimate
+                     colour Delaunay meshes from the dense cloud, remove noise islands,
+                     orient Z-up, scale to print size, decimate
                      ├─ model.glb    coloured mesh for the 3D explorer
                      ├─ model.stl    solidified + voxel-remeshed watertight solid, in mm
                      └─ model.blend  both meshes with a vertex-colour material
@@ -89,7 +90,13 @@ Everything (SQLite database, uploads, job workspaces) goes in `./data`, or in `S
 Each run keeps its full COLMAP workspace in `data/projects/<id>/jobs/<job>/`, including `job.log`, the sparse model and
 `dense/fused.ply`, so you can open the results in the COLMAP GUI or MeshLab.
 
+Video-heavy runs use COLMAP's global mapper for sparse reconstruction, falling back to the incremental mapper if it
+fails. On a 324-frame drone flight the incremental mapper split the flight into six models and kept only the largest
+(210 frames); the global mapper placed 323 frames in one model.
+
 ## Capture tips
+
+The project page has a fuller guide ("How to shoot … that reconstruct well") next to the uploader.
 
 - **Drone:** two or three orbits at different heights and gimbal angles, plus a top-down grid for the roof. Keep 70–80%
   overlap. Overcast light is best.
@@ -99,5 +106,7 @@ Each run keeps its full COLMAP workspace in `data/projects/<id>/jobs/<job>/`, in
 
 ## 3D explorer
 
-Orbit or first-person **walk** mode (WASD/arrows, Q/E for up/down, Shift to go faster), captured colour vs clay
+First-person **walk** mode (the default) or orbit. Walk uses WASD/arrows, Space to rise, C to sink (E/Q also work),
+Shift to go faster and the scroll wheel to set speed. Ctrl is unused because Ctrl+W closes the browser tab. Interiors
+start inside the room, exteriors outside looking in. Also: captured colour vs clay
 shading, wireframe, and a **cut-away** slider that removes the roof or ceiling so you can look into rooms.

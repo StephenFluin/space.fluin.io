@@ -58,27 +58,31 @@ import type { ModelViewer, ViewerMode } from './model-viewer';
             <button
               type="button"
               class="btn small"
-              [attr.aria-pressed]="mode() === 'orbit'"
-              (click)="setMode('orbit')"
-            >
-              Orbit
-            </button>
-            <button
-              type="button"
-              class="btn small"
               [attr.aria-pressed]="mode() === 'walk'"
               (click)="setMode('walk')"
             >
               Walk
+            </button>
+            <button
+              type="button"
+              class="btn small"
+              [attr.aria-pressed]="mode() === 'orbit'"
+              (click)="setMode('orbit')"
+            >
+              Orbit
             </button>
           </div>
           <p class="muted help">
             @if (mode() === 'orbit') {
               Drag to rotate, right-drag to pan, scroll to zoom. Arrow keys orbit too.
             } @else {
-              W A S D or arrow keys to move, Q / E down / up, Shift to go faster.
+              W A S D or arrows to move, Space to rise, C to sink (or E / Q), hold Shift to go
+              faster, scroll to change speed.
             }
           </p>
+          @if (mode() === 'walk') {
+            <p class="muted help" aria-live="polite">Walking speed {{ speed() | number: '1.0-2' }}×</p>
+          }
           <button type="button" class="btn small" (click)="viewer?.resetCamera()">
             Reset view
           </button>
@@ -267,7 +271,8 @@ export class ExplorerPage {
   private readonly canvas = viewChild.required<ElementRef<HTMLCanvasElement>>('canvas');
   protected viewer?: ModelViewer;
 
-  protected readonly mode = signal<ViewerMode>('orbit');
+  protected readonly mode = signal<ViewerMode>('walk');
+  protected readonly speed = signal(1);
   protected readonly locked = signal(false);
   protected readonly loading = signal(true);
   protected readonly loadProgress = signal(0);
@@ -294,6 +299,7 @@ export class ExplorerPage {
       const viewer = await import('./model-viewer');
       this.viewer = new viewer.ModelViewer(this.canvas().nativeElement, {
         onLock: (l) => this.locked.set(l),
+        onSpeed: (s) => this.speed.set(s),
       });
       destroyRef.onDestroy(() => this.viewer?.dispose());
       ready.set(true);
@@ -327,6 +333,9 @@ export class ExplorerPage {
     effect(() => this.ready(ready) && this.viewer!.setGrid(this.grid()));
     effect(() => this.ready(ready) && this.viewer!.setCut(this.cut()));
     effect(() => this.ready(ready) && this.viewer!.setMode(this.mode()));
+    effect(
+      () => this.ready(ready) && this.viewer!.setInterior(this.project.value()?.kind === 'interior'),
+    );
   }
 
   private ready(flag: () => boolean) {

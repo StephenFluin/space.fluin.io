@@ -373,11 +373,23 @@ class Pipeline {
       await step('Sparse reconstruction', async () => {
         await rm(sparseDir, { recursive: true, force: true });
         await mkdir(sparseDir, { recursive: true });
-        await exec(
-          colmap,
-          ['mapper', '--database_path', db_, '--image_path', imagesDir, '--output_path', sparseDir],
-          { progress: true },
-        );
+        const args = ['--database_path', db_, '--image_path', imagesDir, '--output_path', sparseDir];
+        // Video frames: incremental mapping tends to split a long flight into fragments and keep
+        // only the largest; global SfM solves all frames at once (323 vs 210 of 324 in testing).
+        let mapped = false;
+        if (useSequentialMatching(imageCount, photos.length, videos.length)) {
+          try {
+            await exec(colmap, ['global_mapper', ...args]);
+            mapped = (await largestModel(sparseDir)) !== null;
+          } catch {
+            log.write('Global mapper failed, falling back to incremental mapping.\n');
+          }
+          if (!mapped) {
+            await rm(sparseDir, { recursive: true, force: true });
+            await mkdir(sparseDir, { recursive: true });
+          }
+        }
+        if (!mapped) await exec(colmap, ['mapper', ...args], { progress: true });
         const sparse = await largestModel(sparseDir);
         if (!sparse) {
           throw new Error(
@@ -526,6 +538,7 @@ class Pipeline {
           String(settings.targetFaces),
           String(settings.printSizeMm),
           project.kind,
+          fused,
         ]);
         await copyFile(rawMesh, join(outDir, 'mesh.ply'));
         try {

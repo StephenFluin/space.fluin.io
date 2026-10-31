@@ -14,6 +14,7 @@ from mathutils import Matrix, Vector
 
 argv = sys.argv[sys.argv.index("--") + 1:]
 src, out_dir, target_faces, print_mm, kind = argv[0], argv[1], int(argv[2]), float(argv[3]), argv[4]
+cloud = argv[5] if len(argv) > 5 else None  # fused.ply, used to colour meshes that lack colours
 
 def log(msg):
     print("[postprocess] " + msg, flush=True)
@@ -30,6 +31,42 @@ obj = bpy.context.selected_objects[0]
 obj.name = "Scan"
 me = obj.data
 log("imported %d vertices, %d faces" % (len(me.vertices), len(me.polygons)))
+
+# --- Delaunay meshes have no colours: borrow them from the nearest fused points ---
+def read_ply_points(path):
+    with open(path, "rb") as f:
+        header = []
+        while True:
+            line = f.readline().decode("ascii").strip()
+            header.append(line)
+            if line == "end_header":
+                break
+        types = {"float": "<f4", "double": "<f8", "uchar": "u1", "int": "<i4", "uint": "<u4"}
+        props = [l.split()[1:] for l in header if l.startswith("property")]
+        count = int(next(l for l in header if l.startswith("element vertex")).split()[2])
+        dtype = np.dtype([(name, types[t]) for t, name in props])
+        return np.fromfile(f, dtype=dtype, count=count)
+
+def transfer_colours(me, cloud_path, k=4):
+    pts = read_ply_points(cloud_path)
+    if "red" not in pts.dtype.names:
+        return
+    from scipy.spatial import cKDTree
+    xyz = np.stack([pts["x"], pts["y"], pts["z"]], axis=1)
+    rgb = np.stack([pts["red"], pts["green"], pts["blue"]], axis=1).astype(np.float32) / 255
+    co = np.empty(len(me.vertices) * 3, dtype=np.float32)
+    me.vertices.foreach_get("co", co)
+    _, idx = cKDTree(xyz).query(co.reshape(-1, 3), k=k, workers=-1)
+    srgb = rgb[idx].mean(axis=1)
+    rgba = np.ones((len(me.vertices), 4), dtype=np.float32)
+    rgba[:, :3] = srgb
+    layer = me.color_attributes.new("Col", 'BYTE_COLOR', 'POINT')
+    layer.data.foreach_set("color_srgb", rgba.ravel())
+    me.color_attributes.active_color = layer
+    log("coloured %d vertices from %d dense points" % (len(me.vertices), len(xyz)))
+
+if cloud and not me.color_attributes:
+    transfer_colours(me, cloud)
 
 # --- keep only the large connected pieces (photogrammetry leaves floating noise) ---
 def drop_small_islands(me, keep_ratio=0.02):
