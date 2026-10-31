@@ -40,8 +40,10 @@ function stageSeconds(job: Job, name: StageName) {
 export function runAdvice(job: Job): Advice[] {
   const s = job.stats;
   const out: Advice[] = [];
-  const images = s.images ?? 0;
-  const placed = s.registeredImages ?? 0;
+  // Coverage counts the originally sampled images; extra frames only fill in gaps between them.
+  const extras = s.extraFrames ?? 0;
+  const images = (s.images ?? 0) - extras;
+  const placed = (extras ? s.placedOriginal : s.registeredImages) ?? 0;
   const coverage = images ? placed / images : 0;
   const rate = job.settings.videoFps;
   const gaps = s.matchesByGap ?? [];
@@ -49,7 +51,13 @@ export function runAdvice(job: Job): Advice[] {
 
   // 1. Coverage: did COLMAP manage to place the images?
   if (images && s.registeredImages !== undefined) {
-    const summary = `${placed.toLocaleString()} of ${images.toLocaleString()} images placed (${pct(coverage)}).`;
+    const summary =
+      `${placed.toLocaleString()} of ${images.toLocaleString()} images placed (${pct(coverage)}).` +
+      (extras
+        ? ` ${extras} extra frames were sampled automatically where the camera turned or moved ` +
+          `too fast for ${fps(rate)}, and ${Math.max(0, (s.registeredImages ?? 0) - placed)} of ` +
+          'them helped fill gaps.'
+        : '');
     if (coverage >= 0.9) {
       out.push({ tone: 'good', title: 'Enough overlap', detail: summary });
     } else {

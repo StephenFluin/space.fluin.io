@@ -179,6 +179,10 @@ export interface JobStats {
    */
   pathBreaks?: number;
   pathBreakAt?: string;
+  /** Frames sampled at 4× the rate where the first model lost the camera (included in images). */
+  extraFrames?: number;
+  /** Of the originally sampled images (not extras), how many the kept model placed. */
+  placedOriginal?: number;
 }
 
 export interface JobOutput {

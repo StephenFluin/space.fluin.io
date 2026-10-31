@@ -191,7 +191,14 @@ type StepState = 'done' | 'current' | 'failed' | 'pending' | 'skipped';
                   @if (j.stats.videos) {
                     <span class="muted">
                       ({{ j.stats.photos }} photos + {{ j.stats.videoFrames | number }} frames from
-                      {{ j.stats.videos }} {{ j.stats.videos === 1 ? 'video' : 'videos' }})
+                      {{ j.stats.videos }} {{ j.stats.videos === 1 ? 'video' : 'videos'
+                      }}{{
+                        j.stats.extraFrames
+                          ? ', + ' +
+                            j.stats.extraFrames +
+                            ' extra frames where the camera moved fast'
+                          : ''
+                      }})
                     </span>
                   }
                   @if (j.stats.spherical) {
@@ -207,6 +214,12 @@ type StepState = 'done' | 'current' | 'failed' | 'pending' | 'skipped';
                 <dd>
                   {{ j.stats.registeredImages | number }} of {{ j.stats.images | number }}
                   <span class="muted">({{ registeredPct() | number: '1.0-0' }}%)</span>
+                  @if (j.stats.extraFrames && j.stats.placedOriginal !== undefined) {
+                    <span class="muted">
+                      · {{ j.stats.placedOriginal | number }} of
+                      {{ (j.stats.images ?? 0) - j.stats.extraFrames | number }} original frames
+                    </span>
+                  }
                 </dd>
               }
               @if (j.stats.sparsePoints !== undefined) {

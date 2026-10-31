@@ -1,5 +1,6 @@
-import { readFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, rename, rm } from 'node:fs/promises';
 import { join } from 'node:path';
+import type { Command } from './tools';
 
 /** Two consecutive video frames the model placed implausibly far apart or facing away. */
 export interface PathBreak {
@@ -57,7 +58,13 @@ export async function readPoses(modelDir: string): Promise<Map<string, Pose>> {
   return poses;
 }
 
-const FRAME = /^(video-\d+|pano-\d+\/v0)\/frame-(\d+)\.jpg$/;
+/**
+ * Sampled video frames are "frame-00178.jpg"; extra frames added between them are
+ * "frame-00178_25.jpg" (a quarter of the way to 179), which sorts between the two so COLMAP's
+ * sequential matcher pairs it with its neighbours.
+ */
+const FRAME = /^(video-\d+|pano-\d+\/v0)\/frame-(\d+)(?:_(\d\d))?\.jpg$/;
+const frameNumber = (m: RegExpExecArray) => Number(m[2]) + (m[3] ? Number(m[3]) / 100 : 0);
 
 /**
  * Finds places where a video's camera path breaks: neighbouring frames (at most one frame apart)
@@ -71,7 +78,7 @@ export function findPathBreaks(poses: Map<string, Pose>): PathBreak[] {
     const m = FRAME.exec(name);
     if (!m) continue;
     const list = byVideo.get(m[1]) ?? [];
-    list.push({ frame: Number(m[2]), name, pose });
+    list.push({ frame: frameNumber(m), name, pose });
     byVideo.set(m[1], list);
   }
   const pairs: { from: string; to: string; dist: number; turn: number }[] = [];
@@ -104,10 +111,108 @@ export function findPathBreaks(poses: Map<string, Pose>): PathBreak[] {
     .map((p) => ({ from: p.from, to: p.to, step: p.dist / median, turn: p.turn }));
 }
 
-/** "video-12/frame-00178.jpg" → { mediaId: 12, frame: 178 } (frames are numbered from 1). */
+/** "video-12/frame-00178_25.jpg" → { mediaId: 12, frame: 178.25 } (frames are numbered from 1). */
 export function parseFrame(name: string) {
   const m = FRAME.exec(name);
-  return m ? { mediaId: Number(/\d+/.exec(m[1])![0]), frame: Number(m[2]) } : null;
+  return m ? { mediaId: Number(/\d+/.exec(m[1])![0]), frame: frameNumber(m) } : null;
+}
+
+/** Originally sampled video frames (not extras) placed in a model. */
+export function originalFramesIn(poses: Map<string, unknown>) {
+  let n = 0;
+  for (const name of poses.keys()) if (FRAME.exec(name)?.[3] === undefined) n++;
+  return n;
+}
+
+/** Extra frames per original frame in a gap: sampled at 4× the rate. */
+const DENSITY = 4;
+
+/**
+ * Samples extra frames where a model lost the camera: stretches of each video whose frames
+ * weren't placed, and the frames either side of each path break. Those are usually fast turns
+ * or quick moves, where neighbouring frames at the normal rate share too little to link up.
+ * Adds at most as many frames as the video already has. Returns how many were added.
+ */
+export async function addFramesAtGaps(
+  ffmpeg: Command,
+  exec: (cmd: Command, args: string[]) => Promise<unknown>,
+  imagesDir: string,
+  videos: { id: number; path: string }[],
+  fps: number,
+  poses: Map<string, unknown>,
+  breaks: PathBreak[],
+): Promise<number> {
+  let added = 0;
+  for (const video of videos) {
+    const folder = `video-${video.id}`;
+    const files = (await readdir(join(imagesDir, folder))).filter((f) =>
+      /^frame-\d+\.jpg$/.test(f),
+    );
+    const total = files.length;
+    if (total < 10) continue;
+    const hasExtras = (await readdir(join(imagesDir, folder))).some((f) => f.includes('_'));
+    if (hasExtras) continue; // already densified, e.g. a resumed run
+    const placed = new Set<number>();
+    for (const name of poses.keys()) {
+      const f = parseFrame(name);
+      if (f?.mediaId === video.id && Number.isInteger(f.frame)) placed.add(f.frame);
+    }
+    if (!placed.size) continue;
+    // Frames to densify around: unplaced ones, and both ends of each break.
+    const wanted = new Set<number>();
+    for (let k = 1; k <= total; k++) if (!placed.has(k)) wanted.add(k);
+    for (const b of breaks) {
+      for (const name of [b.from, b.to]) {
+        const f = parseFrame(name);
+        if (f?.mediaId === video.id) wanted.add(Math.floor(f.frame));
+      }
+    }
+    if (wanted.size < Math.max(3, total * 0.03)) continue;
+    // Merge into runs, widened by one frame each side so extras link to placed frames.
+    const runs: [number, number][] = [];
+    for (const k of [...wanted].sort((a, b) => a - b)) {
+      const last = runs.at(-1);
+      if (last && k <= last[1] + 2) last[1] = k;
+      else runs.push([k, k]);
+    }
+    let budget = total;
+    for (const [a, b] of runs) {
+      const from = Math.max(1, a - 1);
+      const to = Math.min(total, b + 1);
+      if (to <= from || budget <= 0) continue;
+      const tmp = join(imagesDir, '..', `extra-${video.id}-${from}`);
+      await rm(tmp, { recursive: true, force: true });
+      await mkdir(tmp);
+      await exec(ffmpeg, [
+        '-hide_banner',
+        '-loglevel',
+        'error',
+        '-ss',
+        String((from - 1) / fps),
+        '-to',
+        String((to - 1) / fps),
+        '-i',
+        video.path,
+        '-vf',
+        `fps=${fps * DENSITY},scale='min(3840,iw)':-2`,
+        '-qscale:v',
+        '2',
+        join(tmp, '%05d.jpg'),
+      ]);
+      for (const out of (await readdir(tmp)).sort()) {
+        const frame = from + (Number(out.slice(0, 5)) - 1) / DENSITY;
+        const whole = Math.floor(frame);
+        const part = Math.round((frame - whole) * 100);
+        if (part === 0 || frame >= to || budget <= 0) continue;
+        const name = `frame-${String(whole).padStart(5, '0')}_${String(part).padStart(2, '0')}.jpg`;
+        await rename(join(tmp, out), join(imagesDir, folder, name));
+        added++;
+        budget--;
+      }
+      await rm(tmp, { recursive: true, force: true });
+    }
+  }
+  return added;
 }
 
 function angleBetween(a: number[], b: number[]) {

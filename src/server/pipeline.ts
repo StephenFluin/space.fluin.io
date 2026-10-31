@@ -7,6 +7,7 @@ import {
   open,
   readFile,
   readdir,
+  rename,
   rm,
   stat,
   writeFile,
@@ -32,7 +33,13 @@ import {
   type StageTiming,
 } from '../shared/models';
 import { BLENDER_SCRIPT } from './blender-script';
-import { findPathBreaks, parseFrame, readPoses } from './camera-path';
+import {
+  addFramesAtGaps,
+  findPathBreaks,
+  originalFramesIn,
+  parseFrame,
+  readPoses,
+} from './camera-path';
 import {
   getDb,
   isAlive,
@@ -57,7 +64,7 @@ class Cancelled extends Error {}
 
 /**
  * Runs one reconstruction at a time. Kept on globalThis so dev-server reloads of
- * server.ts don't spawn a second worker against the same database.
+ * server.ts don't spawn a second worker against the same database (see the bottom of this file).
  */
 class Pipeline {
   private running: { jobId: number; child?: ChildProcess; cancelled: boolean } | null = null;
@@ -431,8 +438,7 @@ class Pipeline {
 
       // 3. Structure from motion.
       await step('Sparse reconstruction', async () => {
-        await rm(sparseDir, { recursive: true, force: true });
-        await mkdir(sparseDir, { recursive: true });
+        const sequential = useSequentialMatching(imageCount, photos.length, videos.length);
         const args = [
           '--database_path',
           db_,
@@ -445,49 +451,110 @@ class Pipeline {
         // only the largest; global SfM solves all frames at once and places more of them. But it
         // can also join pieces in the wrong place (overlapping, flipped copies of the scene), so
         // its result is checked for breaks in each video's camera path and discarded if broken.
-        let mapper: 'global' | 'incremental' = 'incremental';
-        if (useSequentialMatching(imageCount, photos.length, videos.length)) {
-          try {
-            const fixed = [
-              ...(pano ? ['--GlobalMapper.refine_sensor_from_rig', '0'] : []),
-              ...(allPano ? ['--GlobalMapper.ba_refine_focal_length', '0'] : []),
-            ];
-            await exec(colmap, ['global_mapper', ...args, ...fixed]);
-            const model = await largestModel(sparseDir);
-            const breaks = model ? findPathBreaks(await readPoses(model)) : [];
-            if (model && !breaks.length) mapper = 'global';
-            else if (model) {
-              log.write(
-                `Global mapper joined pieces in the wrong place (${breaks.length} camera path ` +
-                  `breaks, first ${breaks[0].from} -> ${breaks[0].to}); using incremental mapping.\n`,
-              );
+        const map = async (): Promise<'global' | 'incremental'> => {
+          await rm(sparseDir, { recursive: true, force: true });
+          await mkdir(sparseDir, { recursive: true });
+          if (sequential) {
+            try {
+              const fixed = [
+                ...(pano ? ['--GlobalMapper.refine_sensor_from_rig', '0'] : []),
+                ...(allPano ? ['--GlobalMapper.ba_refine_focal_length', '0'] : []),
+              ];
+              await exec(colmap, ['global_mapper', ...args, ...fixed]);
+              const model = await largestModel(sparseDir);
+              const breaks = model ? findPathBreaks(await readPoses(model)) : [];
+              if (model && !breaks.length) return 'global';
+              if (model) {
+                log.write(
+                  `Global mapper joined pieces in the wrong place (${breaks.length} camera path ` +
+                    `breaks, first ${breaks[0].from} -> ${breaks[0].to}); using incremental mapping.\n`,
+                );
+              }
+            } catch (err) {
+              if (err instanceof Cancelled) throw err;
+              log.write('Global mapper failed, falling back to incremental mapping.\n');
             }
-          } catch (err) {
-            if (err instanceof Cancelled) throw err;
-            log.write('Global mapper failed, falling back to incremental mapping.\n');
-          }
-          if (mapper !== 'global') {
             await rm(sparseDir, { recursive: true, force: true });
             await mkdir(sparseDir, { recursive: true });
           }
-        }
-        const fixed = [
-          ...(pano ? ['--Mapper.ba_refine_sensor_from_rig', '0'] : []),
-          ...(allPano ? ['--Mapper.ba_refine_focal_length', '0'] : []),
-          // Fast turns leave video frames with few matches to the frames before them; accepting
-          // weaker links kept 248 of 324 drone frames in one piece instead of 210, at the same
-          // 0.95 px reprojection error.
-          ...(useSequentialMatching(imageCount, photos.length, videos.length)
-            ? [
-                ...['--Mapper.abs_pose_min_num_inliers', '15'],
-                ...['--Mapper.abs_pose_min_inlier_ratio', '0.15'],
-                ...['--Mapper.init_min_num_inliers', '50'],
-              ]
-            : []),
-        ];
-        if (mapper === 'incremental') {
+          const fixed = [
+            ...(pano ? ['--Mapper.ba_refine_sensor_from_rig', '0'] : []),
+            ...(allPano ? ['--Mapper.ba_refine_focal_length', '0'] : []),
+            // Fast turns leave video frames with few matches to the frames before them; accepting
+            // weaker links kept 248 of 324 drone frames in one piece instead of 210, at the same
+            // 0.95 px reprojection error.
+            ...(sequential
+              ? [
+                  ...['--Mapper.abs_pose_min_num_inliers', '15'],
+                  ...['--Mapper.abs_pose_min_inlier_ratio', '0.15'],
+                  ...['--Mapper.init_min_num_inliers', '50'],
+                ]
+              : []),
+          ];
           await exec(colmap, ['mapper', ...args, ...fixed], { progress: true });
+          return 'incremental';
+        };
+        const quality = async () => {
+          const model = await largestModel(sparseDir);
+          const poses = model ? await readPoses(model) : new Map();
+          return { poses, breaks: findPathBreaks(poses), placed: originalFramesIn(poses) };
+        };
+
+        let mapper = await map();
+        let result = await quality();
+
+        // Where the kept model lost stretches of a video (fast turns, quick moves) or its path
+        // breaks, sample those moments at 4× the rate and map again with the extra frames.
+        const sources = videos
+          .filter((v) => !isSpherical(v.width, v.height))
+          .map((v) => ({ id: v.id, path: join(mediaDir(job.project_id), v.filename) }));
+        const added = sequential
+          ? await addFramesAtGaps(
+              { bin: ffmpegBin(), args: [] },
+              exec,
+              imagesDir,
+              sources,
+              settings.videoFps,
+              result.poses,
+              result.breaks,
+            )
+          : 0;
+        if (added) {
+          log.write(
+            `Added ${added} extra frames where the model lost the camera; mapping again.\n`,
+          );
+          const extract = ['--database_path', db_, '--image_path', imagesDir];
+          await exec(colmap, [
+            'feature_extractor',
+            ...extract,
+            '--ImageReader.single_camera_per_folder',
+            '1',
+            ...cpu.extract,
+          ]);
+          await exec(colmap, ['sequential_matcher', '--database_path', db_, ...cpu.match]);
+          await rm(sparseDir + '-first', { recursive: true, force: true });
+          await rename(sparseDir, sparseDir + '-first');
+          const retry = await map();
+          const second = await quality();
+          const better =
+            second.breaks.length < result.breaks.length ||
+            (second.breaks.length === result.breaks.length && second.placed >= result.placed);
+          if (better) {
+            mapper = retry;
+            result = second;
+            await rm(sparseDir + '-first', { recursive: true, force: true });
+          } else {
+            log.write('Extra frames did not help; keeping the first model.\n');
+            await rm(sparseDir, { recursive: true, force: true });
+            await rename(sparseDir + '-first', sparseDir);
+          }
+          addStats({
+            images: imageCount + added,
+            extraFrames: added,
+            placedOriginal: result.placed,
+          });
         }
+
         const sparse = await largestModel(sparseDir);
         if (!sparse) {
           throw new Error(
@@ -502,11 +569,10 @@ class Pipeline {
           const secs = Math.round((f.frame - 1) / settings.videoFps);
           return `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')} into ${m.original_name}`;
         };
-        const breaks = findPathBreaks(await readPoses(sparse));
         addStats({
           mapper,
-          pathBreaks: breaks.length,
-          pathBreakAt: breaks[0] ? describeFrame(breaks[0].from) : undefined,
+          pathBreaks: result.breaks.length,
+          pathBreakAt: result.breaks[0] ? describeFrame(result.breaks[0].from) : undefined,
         });
         addStats(await this.analyzeModel(colmap, sparse));
         addStats({ models: await countModels(sparseDir) });
@@ -977,4 +1043,8 @@ async function collectOutputs(outDir: string): Promise<JobOutput[]> {
 
 const KEY = Symbol.for('space.fluin.io/pipeline');
 const holder = globalThis as unknown as Record<symbol, Pipeline | undefined>;
-export const pipeline: Pipeline = (holder[KEY] ??= new Pipeline());
+// A dev-server reload brings new pipeline code. Swap it in unless the previous instance is mid-run,
+// since that run's child processes and cancel handle live there.
+const previous = holder[KEY] as unknown as { running?: unknown } | undefined;
+if (!previous?.running) holder[KEY] = new Pipeline();
+export const pipeline: Pipeline = holder[KEY]!;
