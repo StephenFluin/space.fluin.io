@@ -53,10 +53,10 @@ type StepState = 'done' | 'current' | 'failed' | 'pending' | 'skipped';
   imports: [DatePipe, DecimalPipe, RouterLink],
   template: `
     @let j = job();
-    <article class="card" [attr.aria-labelledby]="'job-' + j.id">
+    <article class="card" [class.highlight]="highlight()" [attr.aria-labelledby]="'job-' + j.id">
       <header class="top">
         <div class="title">
-          <h3 [id]="'job-' + j.id">Run #{{ j.id }}</h3>
+          <h3 [id]="'job-' + j.id" tabindex="-1">Run #{{ j.id }}</h3>
           <span class="badge" [class]="j.status">{{ statusLabel() }}</span>
         </div>
         <p class="when muted">
@@ -281,6 +281,28 @@ type StepState = 'done' | 'current' | 'failed' | 'pending' | 'skipped';
       display: grid;
       gap: 0.75rem;
     }
+    .card.highlight {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 1px var(--accent);
+      animation: arrive 1.6s ease-out;
+    }
+    @keyframes arrive {
+      from {
+        box-shadow: 0 0 0 6px var(--accent);
+      }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .card.highlight {
+        animation: none;
+      }
+    }
+    h3:focus {
+      outline: none;
+    }
+    h3:focus-visible {
+      outline: 2px solid var(--focus);
+      outline-offset: 2px;
+    }
     .top {
       display: flex;
       justify-content: space-between;
@@ -463,6 +485,8 @@ export class JobCard {
   readonly job = input.required<Job>();
   /** The newest run starts expanded; older runs collapse to a summary. */
   readonly initiallyExpanded = input(false);
+  /** Marks the run the user just started, so it stands out after the page scrolls to it. */
+  readonly highlight = input(false);
   /** Per-step timing corrections for this machine, for the ETA. */
   readonly calibration = input<Calibration | undefined>(undefined);
   readonly changed = output<void>();

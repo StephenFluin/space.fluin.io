@@ -1,5 +1,8 @@
 import {
   Component,
+  DOCUMENT,
+  Injector,
+  afterNextRender,
   computed,
   effect,
   inject,
@@ -74,7 +77,7 @@ const PREVIEW_LIMIT = 48;
                 </label>
               }
             </fieldset>
-            <span class="visually-hidden" aria-live="polite">{{ kindMessage() }}</span>
+            <span class="visually-hidden" aria-live="polite">{{ announcement() }}</span>
             @if (p.notes) {
               <p class="muted">{{ p.notes }}</p>
             }
@@ -240,6 +243,7 @@ const PREVIEW_LIMIT = 48;
             <app-job-card
               [job]="j"
               [initiallyExpanded]="$first"
+              [highlight]="j.id === justQueued()"
               [calibration]="calibration.value()"
               (changed)="jobs.reload()"
             />
@@ -514,7 +518,28 @@ export class ProjectPage {
     max(s.targetFaces, 5_000_000);
   });
 
+  /** The run just started from this page, highlighted until the next one. */
+  protected readonly justQueued = signal<number | null>(null);
+  private readonly focusPending = signal<number | null>(null);
+  private readonly document = inject(DOCUMENT);
+  private readonly injector = inject(Injector);
+
   constructor() {
+    // Once the new run's card has rendered, move focus to it and scroll it into view.
+    effect(() => {
+      const id = this.focusPending();
+      if (id === null || !this.jobs.value().some((j) => j.id === id)) return;
+      afterNextRender(
+        () => {
+          this.focusPending.set(null);
+          const heading = this.document.getElementById(`job-${id}`);
+          heading?.focus({ preventScroll: true });
+          heading?.closest('article')?.scrollIntoView({ block: 'start' });
+        },
+        { injector: this.injector },
+      );
+    });
+
     // Poll while a run is in progress.
     effect((onCleanup) => {
       if (!this.hasActiveJob()) return;
@@ -533,13 +558,13 @@ export class ProjectPage {
     { value: 'exterior', label: 'Exterior' },
     { value: 'interior', label: 'Interior' },
   ];
-  protected readonly kindMessage = signal('');
+  protected readonly announcement = signal('');
 
   /** Switching kind also resets the run settings to that kind's defaults (via linkedSignal). */
   protected async setKind(kind: ProjectKind) {
     await firstValueFrom(this.api.updateProject(this.id(), { kind }));
     this.project.reload();
-    this.kindMessage.set(`Switched to ${kind}. Run settings reset to ${kind} defaults.`);
+    this.announcement.set(`Switched to ${kind}. Run settings reset to ${kind} defaults.`);
   }
 
   protected thumbSrc(id: number) {
@@ -561,7 +586,13 @@ export class ProjectPage {
   protected async start(event: Event) {
     event.preventDefault();
     await submit(this.settingsForm, async () => {
-      await firstValueFrom(this.api.startJob(this.id(), this.settings()));
+      const job = await firstValueFrom(this.api.startJob(this.id(), this.settings()));
+      // Take the user to the new run so it's clear the click worked.
+      this.justQueued.set(job.id);
+      this.focusPending.set(job.id);
+      this.announcement.set(
+        `Run #${job.id} ${job.status === 'queued' ? 'queued behind the current run' : 'started'}.`,
+      );
       this.jobs.reload();
       return undefined;
     });
