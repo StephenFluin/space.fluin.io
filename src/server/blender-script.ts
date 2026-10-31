@@ -15,6 +15,7 @@ from mathutils import Matrix, Vector
 argv = sys.argv[sys.argv.index("--") + 1:]
 src, out_dir, target_faces, print_mm, kind = argv[0], argv[1], int(argv[2]), float(argv[3]), argv[4]
 cloud = argv[5] if len(argv) > 5 else None  # fused.ply, used to colour meshes that lack colours
+print_faces = int(argv[6]) if len(argv) > 6 else target_faces  # 0 target_faces keeps the view mesh whole
 
 def log(msg):
     print("[postprocess] " + msg, flush=True)
@@ -129,7 +130,8 @@ def decimate(o, faces):
         bpy.ops.object.modifier_apply(modifier=mod.name)
         log("decimated %s %d -> %d faces" % (o.name, count, len(o.data.polygons)))
 
-decimate(obj, target_faces)
+if target_faces > 0:
+    decimate(obj, target_faces)
 
 # vertex-colour material so the .blend and the GLB both show the captured colours
 mat = bpy.data.materials.new("ScanColour")
@@ -160,7 +162,7 @@ remesh.voxel_size = print_mm / 450
 bpy.context.view_layer.objects.active = printable
 for m in list(printable.modifiers):
     bpy.ops.object.modifier_apply(modifier=m.name)
-decimate(printable, target_faces)
+decimate(printable, print_faces)
 log("printable mesh has %d faces" % len(printable.data.polygons))
 
 def only(o):

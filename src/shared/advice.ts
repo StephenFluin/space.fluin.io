@@ -1,5 +1,6 @@
 import {
   DENSE_SIZE,
+  KEEP_ALL_FACES,
   estimateStageSeconds,
   recommendedFaces,
   type Job,
@@ -77,7 +78,8 @@ export function runAdvice(job: Job): Advice[] {
       }
       out.push({
         tone: 'warn',
-        title: coverage < 0.6 ? 'Most of the capture was not used' : 'Part of the capture was not used',
+        title:
+          coverage < 0.6 ? 'Most of the capture was not used' : 'Part of the capture was not used',
         detail: `${summary} ${why.join(' ')}`,
       });
     }
@@ -97,7 +99,9 @@ export function runAdvice(job: Job): Advice[] {
       const spare = gaps.filter((g) => g.gap > 1 && g.low >= SOLID_MATCHES).at(-1);
       if (spare && coverage >= 0.9) {
         const dense = stageSeconds(job, 'Dense stereo');
-        const saved = dense ? ` (dense stereo took ${minutes(dense)}; expect about ${minutes(dense / spare.gap)})` : '';
+        const saved = dense
+          ? ` (dense stereo took ${minutes(dense)}; expect about ${minutes(dense / spare.gap)})`
+          : '';
         out.push({
           tone: 'tip',
           title: `${fps(rate / spare.gap)} would have been enough`,
@@ -120,16 +124,16 @@ export function runAdvice(job: Job): Advice[] {
   // 3. What capped the detail: triangles, dense resolution, or the capture itself.
   const target = job.settings.targetFaces;
   if (s.rawMeshFaces && s.meshFaces) {
-    if (s.rawMeshFaces > target * 1.5) {
+    if (target !== KEEP_ALL_FACES && s.rawMeshFaces > target * 1.5) {
       const printFaces = recommendedFaces(job.settings.printSizeMm);
       out.push({
         tone: 'tip',
         title: 'Triangles limited the 3D view',
         detail:
           `COLMAP's mesh had ${big(s.rawMeshFaces)} triangles and the model kept ${big(s.meshFaces)}. ` +
-          `Raise the triangle count (up to ${big(s.rawMeshFaces)}) for a sharper on-screen model. ` +
-          `For a ${job.settings.printSizeMm} mm print, ${big(printFaces)} is already finer than ` +
-          'a printer can show.',
+          'Raise "3D view triangles" or tick "Keep every triangle" for a sharper on-screen ' +
+          'model. That leaves the STL alone: it has its own "Print triangles" setting, and ' +
+          `${big(printFaces)} is already as fine as a ${job.settings.printSizeMm} mm print can show.`,
       });
     } else {
       out.push({

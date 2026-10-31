@@ -14,6 +14,7 @@ import {
 import { DecimalPipe, NgOptimizedImage } from '@angular/common';
 import {
   FormField,
+  applyWhenValue,
   form,
   max,
   min,
@@ -31,6 +32,11 @@ import {
   estimatedGlbBytes,
   estimatedStlBytes,
   recommendedFaces,
+  viewFaces,
+  KEEP_ALL_FACES,
+  formatCount,
+  MAX_TARGET_FACES,
+  MIN_TARGET_FACES,
   videoFrames,
   mediaImages,
   PANO_VIEWS,
@@ -40,21 +46,27 @@ import {
 import { Api, formatBytes, formatDuration, thumbUrl } from '../api';
 import { JobCard } from '../components/job-card';
 import { MediaUploader } from '../components/media-uploader';
+import { CountInput } from '../components/count-input';
 import { CaptureGuide } from '../components/capture-guide';
 import { ProjectTitle } from '../components/project-title';
 
 const PREVIEW_LIMIT = 48;
+const COUNT_HINT = '; enter a number like 500k or 2M';
 
 /**
  * Requires a number in [lo, hi], with one message for every way it can fail. `describe` gets
- * ", you entered N" (or ", but it's empty") to weave into the sentence.
+ * "; you entered N" (or `blank` when empty or unreadable) to weave into the sentence.
  */
-function range(path: SchemaPath<number>, lo: number, hi: number, describe: (v: string) => string) {
+function range(
+  path: SchemaPath<number>,
+  lo: number,
+  hi: number,
+  describe: (v: string) => string,
+  blank = ", but it's empty",
+) {
   const message = ({ value }: { value: () => number | null }) => {
     const v = value();
-    return describe(
-      v === null || Number.isNaN(v) ? ", but it's empty" : `; you entered ${v.toLocaleString()}`,
-    );
+    return describe(v === null || Number.isNaN(v) ? blank : `; you entered ${v.toLocaleString()}`);
   };
   required(path, { message });
   min(path, lo, { message });
@@ -72,6 +84,7 @@ function range(path: SchemaPath<number>, lo: number, hi: number, describe: (v: s
     MediaUploader,
     ProjectTitle,
     CaptureGuide,
+    CountInput,
   ],
   template: `
     <div class="page">
@@ -223,39 +236,88 @@ function range(path: SchemaPath<number>, lo: number, hi: number, describe: (v: s
                 }
               </div>
               <div class="field">
-                <label for="faces">Target triangles</label>
-                <input
-                  id="faces"
-                  type="number"
-                  step="50000"
-                  [formField]="settingsForm.targetFaces"
-                  [attr.aria-invalid]="settingsForm.targetFaces().invalid()"
-                  [attr.aria-describedby]="
-                    settingsForm.targetFaces().invalid() ? 'faces-error faces-hint' : 'faces-hint'
+                <label [attr.for]="keepAll() ? null : 'faces'">3D view triangles</label>
+                @if (!keepAll()) {
+                  <app-count-input
+                    inputId="faces"
+                    [formField]="settingsForm.targetFaces"
+                    [describedBy]="
+                      settingsForm.targetFaces().invalid() ? 'faces-error faces-hint' : 'faces-hint'
+                    "
+                  />
+                  @if (settingsForm.targetFaces().invalid()) {
+                    <span id="faces-error" class="error">{{
+                      firstError(settingsForm.targetFaces)
+                    }}</span>
+                  }
+                  <div class="presets" role="group" aria-label="3D view triangle presets">
+                    @for (f of viewPresets; track f) {
+                      <button
+                        type="button"
+                        class="btn small"
+                        [attr.aria-pressed]="settings().targetFaces === f"
+                        (click)="setFaces(f)"
+                      >
+                        {{ short(f) }}
+                      </button>
+                    }
+                  </div>
+                }
+                <label class="check">
+                  <input
+                    type="checkbox"
+                    [checked]="keepAll()"
+                    (change)="toggleKeepAll()"
+                    aria-describedby="faces-hint"
+                  />
+                  Keep every triangle COLMAP makes
+                </label>
+                <span id="faces-hint" class="hint">
+                  For the explorer and the .glb and .blend downloads.
+                  @if (keepAll()) {
+                    COLMAP's mesh is often 2–10M triangles (about 60–300 MB GLB, slow to open on
+                    phones).
+                  } @else {
+                    @if (glbBytes(); as bytes) {
+                      About {{ size(bytes) }} GLB.
+                    }
+                    More triangles only help up to what COLMAP made; the run report says how many
+                    that was.
+                  }
+                </span>
+              </div>
+              <div class="field">
+                <label for="stl-faces">Print triangles (STL)</label>
+                <app-count-input
+                  inputId="stl-faces"
+                  [formField]="settingsForm.printFaces"
+                  [describedBy]="
+                    settingsForm.printFaces().invalid() ? 'stl-error stl-hint' : 'stl-hint'
                   "
                 />
-                @if (settingsForm.targetFaces().invalid()) {
-                  <span id="faces-error" class="error">{{
-                    firstError(settingsForm.targetFaces)
+                @if (settingsForm.printFaces().invalid()) {
+                  <span id="stl-error" class="error">{{
+                    firstError(settingsForm.printFaces)
                   }}</span>
                 }
-                <div class="presets" role="group" aria-label="Triangle presets">
-                  @for (f of facePresets; track f) {
+                <div class="presets" role="group" aria-label="Print triangle presets">
+                  @for (f of printPresets; track f) {
                     <button
                       type="button"
                       class="btn small"
-                      [attr.aria-pressed]="settings().targetFaces === f"
-                      (click)="setFaces(f)"
+                      [attr.aria-pressed]="settings().printFaces === f"
+                      (click)="setPrintFaces(f)"
                     >
                       {{ short(f) }}{{ f === recommended() ? ' ★' : '' }}
                     </button>
                   }
                 </div>
-                <span id="faces-hint" class="hint">
-                  ★ {{ short(recommended()) }} suits a {{ settings().printSizeMm }} mm print: any
-                  finer and a 0.4 mm nozzle can't show it. Go higher only for on-screen detail
-                  (walkthroughs). Files: about {{ size(stlBytes()) }} STL, {{ size(glbBytes()) }}
-                  GLB.
+                <span id="stl-hint" class="hint">
+                  The printable model.stl is capped at this. ★ {{ short(recommended()) }} suits a
+                  {{ settings().printSizeMm }} mm print: a 0.4 mm nozzle can't show finer detail.
+                  @if (stlBytes(); as bytes) {
+                    About {{ size(bytes) }}.
+                  }
                 </span>
               </div>
               <div class="estimate" aria-live="polite">
@@ -434,6 +496,20 @@ function range(path: SchemaPath<number>, lo: number, hi: number, describe: (v: s
       padding: 0 0.45rem;
       background: var(--surface);
     }
+    .field .check {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      font-weight: 400;
+      cursor: pointer;
+    }
+    .field .check input {
+      min-height: 0;
+      width: 1.1rem;
+      height: 1.1rem;
+      margin: 0;
+      accent-color: var(--accent);
+    }
     .presets {
       display: flex;
       flex-wrap: wrap;
@@ -526,17 +602,43 @@ export class ProjectPage {
     return '~' + formatDuration(secs * 1000);
   });
 
-  protected readonly facePresets = [100_000, 250_000, 500_000, 1_000_000, 2_000_000];
+  protected readonly viewPresets = [
+    500_000, 1_000_000, 2_000_000, 5_000_000, 10_000_000, 20_000_000,
+  ];
+  protected readonly printPresets = [100_000, 250_000, 500_000, 1_000_000, 2_000_000];
   protected readonly recommended = computed(() => recommendedFaces(this.settings().printSizeMm));
-  protected readonly stlBytes = computed(() => estimatedStlBytes(this.settings().targetFaces));
-  protected readonly glbBytes = computed(() => estimatedGlbBytes(this.settings().targetFaces));
+  /** Estimated file sizes, or null while the count field can't be read. */
+  protected readonly stlBytes = computed(() => {
+    const faces = this.settings().printFaces;
+    return Number.isNaN(faces) ? null : estimatedStlBytes(faces);
+  });
+  protected readonly glbBytes = computed(() => {
+    const faces = viewFaces(this.settings());
+    return Number.isNaN(faces) ? null : estimatedGlbBytes(faces);
+  });
+  protected readonly keepAll = computed(() => this.settings().targetFaces === KEEP_ALL_FACES);
+  /** The count to go back to when "keep every triangle" is unticked. */
+  private lastFaces = 0;
 
   protected setFaces(faces: number) {
     this.settings.update((s) => ({ ...s, targetFaces: faces }));
   }
 
+  protected setPrintFaces(faces: number) {
+    this.settings.update((s) => ({ ...s, printFaces: faces }));
+  }
+
+  protected toggleKeepAll() {
+    if (this.keepAll()) {
+      this.setFaces(this.lastFaces || DEFAULT_SETTINGS[this.kind()].targetFaces);
+    } else {
+      this.lastFaces = this.settings().targetFaces;
+      this.setFaces(KEEP_ALL_FACES);
+    }
+  }
+
   protected short(n: number) {
-    return n >= 1_000_000 ? `${n / 1_000_000}M` : `${n / 1000}k`;
+    return formatCount(n);
   }
 
   protected duration(seconds: number) {
@@ -572,7 +674,7 @@ export class ProjectPage {
 
   /** Settings start from the defaults for the project kind and reset when the kind is known. */
   private readonly kind = computed(() => this.project.value()?.kind ?? 'exterior');
-  protected readonly settings = linkedSignal<JobSettings>(() =>
+  protected readonly settings = linkedSignal<Required<JobSettings>>(() =>
     structuredClone(DEFAULT_SETTINGS[this.kind()]),
   );
   protected readonly settingsForm = form(this.settings, (s) => {
@@ -583,11 +685,24 @@ export class ProjectPage {
       (v) => `Video frames per second must be between 0.1 and 10${v}. 1–2 suits most footage.`,
     );
     range(s.printSizeMm, 10, 1000, (v) => `Print size must be between 10 and 1,000 mm${v}.`);
-    range(
+    applyWhenValue(
       s.targetFaces,
-      10_000,
-      5_000_000,
-      (v) => `Target triangles must be between 10,000 and 5,000,000${v}. Use a preset if unsure.`,
+      (v) => v !== KEEP_ALL_FACES,
+      (faces) =>
+        range(
+          faces,
+          MIN_TARGET_FACES,
+          MAX_TARGET_FACES,
+          (v) => `3D view triangles must be between 10k and 20M${v}.`,
+          COUNT_HINT,
+        ),
+    );
+    range(
+      s.printFaces,
+      MIN_TARGET_FACES,
+      MAX_TARGET_FACES,
+      (v) => `Print triangles must be between 10k and 20M${v}.`,
+      COUNT_HINT,
     );
   });
 

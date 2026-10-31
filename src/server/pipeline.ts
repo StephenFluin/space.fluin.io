@@ -19,6 +19,7 @@ import {
   PANO_VIEWS,
   STAGES,
   isSpherical,
+  stlFaces,
   useSequentialMatching,
   type JobOutput,
   type JobSettings,
@@ -317,7 +318,15 @@ class Pipeline {
             rigs.push({ prefix, size });
             const input = join(mediaDir(job.project_id), v.filename);
             const out = join(imagesDir, prefix);
-            await splitPanorama(ffmpeg, exec, input, out, size, 'frame-%05d.jpg', settings.videoFps);
+            await splitPanorama(
+              ffmpeg,
+              exec,
+              input,
+              out,
+              size,
+              'frame-%05d.jpg',
+              settings.videoFps,
+            );
             setFraction((i + 1) / videos.length);
             continue;
           }
@@ -348,13 +357,14 @@ class Pipeline {
           videos: videos.length,
           videoFrames: await videoFrameCount(imagesDir),
           spherical: [...photos, ...videos].filter((m) => isSpherical(m.width, m.height)).length,
-          sourceWidth: Math.max(
-            0,
-            ...rigs.map((g) => g.size),
-            ...[...photos, ...videos]
-              .filter((m) => !isSpherical(m.width, m.height) && m.width && m.width > 0)
-              .map((m) => Math.min(m.width!, m.type === 'video' ? 3840 : Infinity)),
-          ) || undefined,
+          sourceWidth:
+            Math.max(
+              0,
+              ...rigs.map((g) => g.size),
+              ...[...photos, ...videos]
+                .filter((m) => !isSpherical(m.width, m.height) && m.width && m.width > 0)
+                .map((m) => Math.min(m.width!, m.type === 'video' ? 3840 : Infinity)),
+            ) || undefined,
         });
         if (imageCount < 3) throw new Error('Need at least 3 images (or a video) to reconstruct');
       });
@@ -369,7 +379,8 @@ class Pipeline {
         log.write('No GPU available to COLMAP: extracting and matching features on the CPU\n');
       }
 
-      const pano = existsSync(rigConfig) && JSON.parse(await readFile(rigConfig, 'utf8')).length > 0;
+      const pano =
+        existsSync(rigConfig) && JSON.parse(await readFile(rigConfig, 'utf8')).length > 0;
       // 360° views have exact intrinsics from ffmpeg; refine focal lengths only for real cameras.
       const allPano = pano && media.every((m) => isSpherical(m.width, m.height));
 
@@ -421,7 +432,14 @@ class Pipeline {
       await step('Sparse reconstruction', async () => {
         await rm(sparseDir, { recursive: true, force: true });
         await mkdir(sparseDir, { recursive: true });
-        const args = ['--database_path', db_, '--image_path', imagesDir, '--output_path', sparseDir];
+        const args = [
+          '--database_path',
+          db_,
+          '--image_path',
+          imagesDir,
+          '--output_path',
+          sparseDir,
+        ];
         // Video frames: incremental mapping tends to split a long flight into fragments and keep
         // only the largest; global SfM solves all frames at once (323 vs 210 of 324 in testing).
         let mapped = false;
@@ -601,6 +619,7 @@ class Pipeline {
           String(settings.printSizeMm),
           project.kind,
           fused,
+          String(stlFaces(settings)),
         ]);
         await copyFile(rawMesh, join(outDir, 'mesh.ply'));
         try {
@@ -757,7 +776,10 @@ function panoRigConfig(rig: PanoRig) {
   const f = rig.size / 2; // 90° field of view
   // One focal length, not PINHOLE's fx/fy: with every camera at one height, bundle adjustment
   // can otherwise trade fy against vertical scale and stretch rooms ~2× taller (seen in testing).
-  const camera = { camera_model_name: 'SIMPLE_PINHOLE', camera_params: [f, rig.size / 2, rig.size / 2] };
+  const camera = {
+    camera_model_name: 'SIMPLE_PINHOLE',
+    camera_params: [f, rig.size / 2, rig.size / 2],
+  };
   return {
     cameras: Array.from({ length: PANO_VIEWS }, (_, i) => {
       const prefix = { image_prefix: `${rig.prefix}/v${i}/`, ...camera };

@@ -6,6 +6,9 @@ import { open, rm, stat, unlink } from 'node:fs/promises';
 import { extname, join } from 'node:path';
 import {
   DEFAULT_SETTINGS,
+  KEEP_ALL_FACES,
+  MAX_TARGET_FACES,
+  MIN_TARGET_FACES,
   STAGES,
   estimateStageSeconds,
   isSpherical,
@@ -135,7 +138,13 @@ function parseSettings(kind: ProjectKind, body: Partial<JobSettings> = {}): JobS
     mesher: meshers.includes(body.mesher as Mesher) ? (body.mesher as Mesher) : d.mesher,
     videoFps: clamp(body.videoFps, 0.1, 10, d.videoFps),
     printSizeMm: clamp(body.printSizeMm, 10, 1000, d.printSizeMm),
-    targetFaces: Math.round(clamp(body.targetFaces, 10_000, 5_000_000, d.targetFaces)),
+    targetFaces:
+      Number(body.targetFaces) === KEEP_ALL_FACES
+        ? KEEP_ALL_FACES
+        : Math.round(clamp(body.targetFaces, MIN_TARGET_FACES, MAX_TARGET_FACES, d.targetFaces)),
+    printFaces: Math.round(
+      clamp(body.printFaces, MIN_TARGET_FACES, MAX_TARGET_FACES, d.printFaces ?? d.targetFaces),
+    ),
   };
 }
 

@@ -11,7 +11,10 @@ import {
 import { DatePipe, DecimalPipe } from '@angular/common';
 import { RouterLink } from '@angular/router';
 import {
+  KEEP_ALL_FACES,
   PANO_VIEWS,
+  formatCount,
+  stlFaces,
   STAGES,
   calibratedStageSeconds,
   type Calibration,
@@ -74,7 +77,8 @@ type StepState = 'done' | 'current' | 'failed' | 'pending' | 'skipped';
         {{ qualityLabel() }} quality ·
         {{ j.settings.mesher === 'poisson' ? 'Poisson' : 'Delaunay' }} mesh ·
         {{ j.settings.videoFps }} fps video · {{ j.settings.printSizeMm }} mm print ·
-        {{ j.settings.targetFaces | number }} triangles
+        {{ j.settings.targetFaces === keepAll ? 'all' : short(j.settings.targetFaces) }}
+        triangles in 3D · {{ short(stlFaces(j.settings)) }} in STL
       </p>
 
       @if (active()) {
@@ -191,9 +195,7 @@ type StepState = 'done' | 'current' | 'failed' | 'pending' | 'skipped';
                     </span>
                   }
                   @if (j.stats.spherical) {
-                    <span class="muted">
-                      · each 360° frame split into {{ panoViews }} views
-                    </span>
+                    <span class="muted"> · each 360° frame split into {{ panoViews }} views </span>
                   }
                 </dd>
               } @else {
@@ -514,6 +516,9 @@ export class JobCard {
     this.job().status === 'done' || this.job().status === 'failed' ? runAdvice(this.job()) : [],
   );
   protected readonly tips = computed(() => this.advice().filter((a) => a.tone !== 'good').length);
+  protected readonly keepAll = KEEP_ALL_FACES;
+  protected readonly short = formatCount;
+  protected readonly stlFaces = stlFaces;
   protected readonly adviceIcons = { good: '✓', warn: '!', tip: '→' } as const;
   protected readonly toneLabels = { good: 'Good', warn: 'Problem', tip: 'Suggestion' } as const;
   protected readonly hasGlb = computed(() => this.job().outputs.some((o) => o.kind === 'glb'));

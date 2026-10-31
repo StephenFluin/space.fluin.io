@@ -60,9 +60,50 @@ export interface JobSettings {
   videoFps: number;
   /** Longest side of the printed model in millimetres. */
   printSizeMm: number;
-  /** Target triangle count of the decimated mesh used for STL/GLB. */
+  /**
+   * Triangles kept in the 3D view (explorer, model.glb and model.blend), or KEEP_ALL_FACES to keep
+   * every triangle COLMAP produced.
+   */
   targetFaces: number;
+  /** Triangle cap for the printable model.stl. Runs from before it existed used `targetFaces`. */
+  printFaces?: number;
 }
+
+/** `targetFaces` value meaning "don't decimate the 3D view". */
+export const KEEP_ALL_FACES = 0;
+export const MIN_TARGET_FACES = 10_000;
+export const MAX_TARGET_FACES = 20_000_000;
+
+/**
+ * Reads a count typed as "250000", "250,000", "250k", "1.5M" or "10m". Returns null when empty
+ * and NaN when it can't be read.
+ */
+export function parseCount(text: string): number | null {
+  const t = text.replace(/[\s,_]/g, '');
+  if (!t) return null;
+  const m = /^(\d*\.?\d+)([km]?)$/i.exec(t);
+  if (!m) return NaN;
+  const scale = { '': 1, k: 1e3, m: 1e6 }[m[2].toLowerCase() as '' | 'k' | 'm'];
+  return Math.round(Number(m[1]) * scale);
+}
+
+/** 250000 → "250k", 1500000 → "1.5M"; counts that don't round neatly keep all their digits. */
+export function formatCount(n: number): string {
+  if (n >= 1e6 && n % 1e5 === 0) return `${n / 1e6}M`;
+  if (n >= 1e3 && n % 1e3 === 0) return `${n / 1e3}k`;
+  return n.toLocaleString('en');
+}
+/** COLMAP meshes from real captures typically land between 2M and 10M triangles. */
+const TYPICAL_RAW_FACES = 5_000_000;
+
+/** Triangles to plan for in the GLB (estimates and file sizes). */
+export const viewFaces = (s: Pick<JobSettings, 'targetFaces'>) =>
+  s.targetFaces === KEEP_ALL_FACES ? TYPICAL_RAW_FACES : s.targetFaces;
+
+/** Triangles kept in the STL. */
+export const stlFaces = (s: Pick<JobSettings, 'targetFaces' | 'printFaces' | 'printSizeMm'>) =>
+  s.printFaces ??
+  (s.targetFaces === KEEP_ALL_FACES ? recommendedFaces(s.printSizeMm) : s.targetFaces);
 
 /**
  * Pipeline steps in order, with the share of total run time each typically takes
@@ -167,20 +208,22 @@ export interface SystemStatus {
   ready: boolean;
 }
 
-export const DEFAULT_SETTINGS: Record<ProjectKind, JobSettings> = {
+export const DEFAULT_SETTINGS: Record<ProjectKind, Required<JobSettings>> = {
   exterior: {
     quality: 'medium',
     mesher: 'poisson',
     videoFps: 1,
-    printSizeMm: 150,
+    printSizeMm: 250,
     targetFaces: 500_000,
+    printFaces: 1_000_000,
   },
   interior: {
     quality: 'medium',
     mesher: 'delaunay',
     videoFps: 2,
-    printSizeMm: 200,
+    printSizeMm: 250,
     targetFaces: 1_000_000,
+    printFaces: 1_000_000,
   },
 };
 
@@ -228,7 +271,7 @@ export function estimateStageSeconds(i: EstimateInput): Record<StageName, number
     'Dense stereo': 0.6 * n * 2 * sources * side,
     'Fusing point cloud': 2 + 0.05 * n * mp,
     Meshing: 10 + 0.8 * n * mp,
-    'Post-processing in Blender': 15 + (i.targetFaces / 1_000_000) * 70,
+    'Post-processing in Blender': 15 + (viewFaces(i) / 1_000_000) * 70,
   };
 }
 
