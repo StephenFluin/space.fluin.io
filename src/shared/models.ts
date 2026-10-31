@@ -171,6 +171,14 @@ export interface JobStats {
   matchesByGap?: GapMatches[];
   /** Triangles in COLMAP's mesh before Blender decimated it to the target. */
   rawMeshFaces?: number;
+  /** Which structure-from-motion solver produced the kept model. */
+  mapper?: 'global' | 'incremental';
+  /**
+   * Places where neighbouring video frames ended up far apart or facing away in the model, meaning
+   * pieces were joined in the wrong place. `pathBreakAt` names the first one.
+   */
+  pathBreaks?: number;
+  pathBreakAt?: string;
 }
 
 export interface JobOutput {

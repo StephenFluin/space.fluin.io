@@ -92,9 +92,12 @@ Everything (SQLite database, uploads, job workspaces) goes in `./data`, or in `S
 Each run keeps its full COLMAP workspace in `data/projects/<id>/jobs/<job>/`, including `job.log`, the sparse model and
 `dense/fused.ply`, so you can open the results in the COLMAP GUI or MeshLab.
 
-Video-heavy runs use COLMAP's global mapper for sparse reconstruction, falling back to the incremental mapper if it
-fails. On a 324-frame drone flight the incremental mapper split the flight into six models and kept only the largest
-(210 frames); the global mapper placed 323 frames in one model.
+Video-heavy runs try COLMAP's global mapper first, because it places every frame in one model. Its result is then
+checked: neighbouring video frames must sit close together and face roughly the same way. Where the global mapper joined
+pieces in the wrong place (on a drone flight and two deck walkthroughs it produced overlapping, misaligned or mirrored
+copies of the scene), the run falls back to the incremental mapper. That mapper keeps only the largest consistent
+piece, with relaxed thresholds so fast turns break it less often (248 of 324 drone frames instead of 210). The run
+report warns when the kept model still has breaks.
 
 ## Capture tips
 

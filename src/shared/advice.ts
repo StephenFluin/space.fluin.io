@@ -62,9 +62,9 @@ export function runAdvice(job: Job): Advice[] {
       }
       if (s.videos && neighbours && neighbours.low >= SOLID_MATCHES && (s.models ?? 1) > 1) {
         why.push(
-          `Neighbouring frames match well (${neighbours.low}+ matches), so the footage is fine ` +
-            'and the mapper failed to join the pieces. Run it again: video runs now use the ' +
-            'global mapper, which joins long flights far more reliably.',
+          `Neighbouring frames usually match well (${neighbours.low}+ matches), so the breaks ` +
+            'are at a few fast turns or quick moves. Try ' +
+            `${fps(rate * 2)} so those moments get more frames, or turn more slowly.`,
         );
       } else if (s.videos && neighbours && neighbours.low < SOLID_MATCHES) {
         why.push(
@@ -85,6 +85,20 @@ export function runAdvice(job: Job): Advice[] {
     }
   }
 
+  // 1b. Consistency: pieces joined in the wrong place look like overlapping copies of the scene.
+  if (s.pathBreaks) {
+    out.push({
+      tone: 'warn',
+      title: 'Parts of the model are misaligned',
+      detail:
+        `The camera path jumps in ${s.pathBreaks} place${s.pathBreaks > 1 ? 's' : ''}` +
+        (s.pathBreakAt ? ` (first at ${s.pathBreakAt})` : '') +
+        ', so pieces of the scene were joined in the wrong place and overlap. This happens where ' +
+        'the camera turns or moves quickly between sampled frames. Try ' +
+        `${fps(rate * 2)}, or slow down at that point in the footage.`,
+    });
+  }
+
   // 2. Video frame density, measured from matches between frames 1, 2, 4 and 8 apart.
   if (s.videos && neighbours) {
     if (neighbours.low < WEAK_MATCHES) {
@@ -96,8 +110,17 @@ export function runAdvice(job: Job): Advice[] {
           `${fps(rate * 2)} next time, or film more slowly.`,
       });
     } else {
-      const spare = gaps.filter((g) => g.gap > 1 && g.low >= SOLID_MATCHES).at(-1);
-      if (spare && coverage >= 0.9) {
+      // Only suggest a lower rate when frames twice as far apart still link up too: each frame
+      // needs more than its immediate neighbour to be placed reliably.
+      const spare = gaps
+        .filter(
+          (g) =>
+            g.gap > 1 &&
+            g.low >= SOLID_MATCHES &&
+            (gaps.find((h) => h.gap === g.gap * 2)?.low ?? 0) >= WEAK_MATCHES,
+        )
+        .at(-1);
+      if (spare && coverage >= 0.9 && !s.pathBreaks) {
         const dense = stageSeconds(job, 'Dense stereo');
         const saved = dense
           ? ` (dense stereo took ${minutes(dense)}; expect about ${minutes(dense / spare.gap)})`

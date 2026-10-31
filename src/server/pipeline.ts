@@ -32,6 +32,7 @@ import {
   type StageTiming,
 } from '../shared/models';
 import { BLENDER_SCRIPT } from './blender-script';
+import { findPathBreaks, parseFrame, readPoses } from './camera-path';
 import {
   getDb,
   isAlive,
@@ -441,8 +442,10 @@ class Pipeline {
           sparseDir,
         ];
         // Video frames: incremental mapping tends to split a long flight into fragments and keep
-        // only the largest; global SfM solves all frames at once (323 vs 210 of 324 in testing).
-        let mapped = false;
+        // only the largest; global SfM solves all frames at once and places more of them. But it
+        // can also join pieces in the wrong place (overlapping, flipped copies of the scene), so
+        // its result is checked for breaks in each video's camera path and discarded if broken.
+        let mapper: 'global' | 'incremental' = 'incremental';
         if (useSequentialMatching(imageCount, photos.length, videos.length)) {
           try {
             const fixed = [
@@ -450,11 +453,20 @@ class Pipeline {
               ...(allPano ? ['--GlobalMapper.ba_refine_focal_length', '0'] : []),
             ];
             await exec(colmap, ['global_mapper', ...args, ...fixed]);
-            mapped = (await largestModel(sparseDir)) !== null;
-          } catch {
+            const model = await largestModel(sparseDir);
+            const breaks = model ? findPathBreaks(await readPoses(model)) : [];
+            if (model && !breaks.length) mapper = 'global';
+            else if (model) {
+              log.write(
+                `Global mapper joined pieces in the wrong place (${breaks.length} camera path ` +
+                  `breaks, first ${breaks[0].from} -> ${breaks[0].to}); using incremental mapping.\n`,
+              );
+            }
+          } catch (err) {
+            if (err instanceof Cancelled) throw err;
             log.write('Global mapper failed, falling back to incremental mapping.\n');
           }
-          if (!mapped) {
+          if (mapper !== 'global') {
             await rm(sparseDir, { recursive: true, force: true });
             await mkdir(sparseDir, { recursive: true });
           }
@@ -462,14 +474,40 @@ class Pipeline {
         const fixed = [
           ...(pano ? ['--Mapper.ba_refine_sensor_from_rig', '0'] : []),
           ...(allPano ? ['--Mapper.ba_refine_focal_length', '0'] : []),
+          // Fast turns leave video frames with few matches to the frames before them; accepting
+          // weaker links kept 248 of 324 drone frames in one piece instead of 210, at the same
+          // 0.95 px reprojection error.
+          ...(useSequentialMatching(imageCount, photos.length, videos.length)
+            ? [
+                ...['--Mapper.abs_pose_min_num_inliers', '15'],
+                ...['--Mapper.abs_pose_min_inlier_ratio', '0.15'],
+                ...['--Mapper.init_min_num_inliers', '50'],
+              ]
+            : []),
         ];
-        if (!mapped) await exec(colmap, ['mapper', ...args, ...fixed], { progress: true });
+        if (mapper === 'incremental') {
+          await exec(colmap, ['mapper', ...args, ...fixed], { progress: true });
+        }
         const sparse = await largestModel(sparseDir);
         if (!sparse) {
           throw new Error(
             'Sparse reconstruction failed: no images could be registered. Add more overlap.',
           );
         }
+        // "1:23 into flight.mp4", from the frame number and the sampling rate.
+        const describeFrame = (name: string) => {
+          const f = parseFrame(name);
+          const m = f && media.find((x) => x.id === f.mediaId);
+          if (!f || !m) return name;
+          const secs = Math.round((f.frame - 1) / settings.videoFps);
+          return `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')} into ${m.original_name}`;
+        };
+        const breaks = findPathBreaks(await readPoses(sparse));
+        addStats({
+          mapper,
+          pathBreaks: breaks.length,
+          pathBreakAt: breaks[0] ? describeFrame(breaks[0].from) : undefined,
+        });
         addStats(await this.analyzeModel(colmap, sparse));
         addStats({ models: await countModels(sparseDir) });
       });
