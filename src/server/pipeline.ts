@@ -724,6 +724,7 @@ class Pipeline {
           project.kind,
           fused,
           String(stlFaces(settings)),
+          settings.flatten ? '1' : '0',
         ]);
         await copyFile(rawMesh, join(outDir, 'mesh.ply'));
         try {
@@ -732,6 +733,7 @@ class Pipeline {
             meshFaces: post.faces,
             printableFaces: post.printableFaces,
             dimensionsMm: post.dimensionsMm,
+            ...(settings.flatten ? { flatPlanes: post.flatPlanes, flatShare: post.flatShare } : {}),
           });
         } catch {
           // Stats are informational only.

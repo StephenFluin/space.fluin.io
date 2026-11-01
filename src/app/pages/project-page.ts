@@ -202,6 +202,18 @@ function range(
                 <span id="mesher-hint" class="hint"
                   >Poisson suits exteriors; Delaunay keeps thin walls.</span
                 >
+                <label class="check">
+                  <input
+                    type="checkbox"
+                    [formField]="settingsForm.flatten"
+                    aria-describedby="flatten-hint"
+                  />
+                  Flatten walls and floors
+                </label>
+                <span id="flatten-hint" class="hint">
+                  Presses large flat areas (walls, floors, ceilings, cabinet fronts) flat, so they
+                  aren't bumpy and need few triangles. Leave off for roofs and terrain.
+                </span>
               </div>
               <div class="field">
                 <label for="fps">Video frames per second</label>

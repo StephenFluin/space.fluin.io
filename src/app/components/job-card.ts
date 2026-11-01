@@ -8,7 +8,7 @@ import {
   output,
   signal,
 } from '@angular/core';
-import { DatePipe, DecimalPipe } from '@angular/common';
+import { DatePipe, DecimalPipe, PercentPipe } from '@angular/common';
 import { RouterLink } from '@angular/router';
 import {
   KEEP_ALL_FACES,
@@ -53,7 +53,7 @@ type StepState = 'done' | 'current' | 'failed' | 'pending' | 'skipped';
 /** One reconstruction run: step-by-step progress with ETA, run facts, downloads and the log. */
 @Component({
   selector: 'app-job-card',
-  imports: [DatePipe, DecimalPipe, RouterLink],
+  imports: [DatePipe, DecimalPipe, PercentPipe, RouterLink],
   template: `
     @let j = job();
     <article class="card" [class.highlight]="highlight()" [attr.aria-labelledby]="'job-' + j.id">
@@ -78,7 +78,9 @@ type StepState = 'done' | 'current' | 'failed' | 'pending' | 'skipped';
         {{ j.settings.mesher === 'poisson' ? 'Poisson' : 'Delaunay' }} mesh ·
         {{ j.settings.videoFps }} fps video · {{ j.settings.printSizeMm }} mm print ·
         {{ j.settings.targetFaces === keepAll ? 'all' : short(j.settings.targetFaces) }}
-        triangles in 3D · {{ short(stlFaces(j.settings)) }} in STL
+        triangles in 3D · {{ short(stlFaces(j.settings)) }} in STL{{
+          j.settings.flatten ? ' · flat walls' : ''
+        }}
       </p>
 
       @if (active()) {
@@ -242,6 +244,13 @@ type StepState = 'done' | 'current' | 'failed' | 'pending' | 'skipped';
                 <dd>
                   {{ j.stats.meshFaces | number }} triangles
                   <span class="muted">· printable {{ j.stats.printableFaces | number }}</span>
+                </dd>
+              }
+              @if (j.stats.flatPlanes !== undefined) {
+                <dt>Flattened</dt>
+                <dd>
+                  {{ j.stats.flatPlanes }} flat surfaces
+                  <span class="muted">· {{ j.stats.flatShare ?? 0 | percent }} of the mesh</span>
                 </dd>
               }
               @if (j.stats.dimensionsMm; as d) {

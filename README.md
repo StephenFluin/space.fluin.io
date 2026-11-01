@@ -14,7 +14,7 @@ videos ─┴─ ffmpeg frame sampling ──► features ► matching ► spars
                                                                                      │
                      Blender (headless) ◄────────────────────────────────────────────┘
                      colour Delaunay meshes from the dense cloud, remove noise islands,
-                     orient Z-up, scale to print size, decimate
+                     orient Z-up, scale to print size, flatten walls (optional), decimate
                      ├─ model.glb    coloured mesh for the 3D explorer
                      ├─ model.stl    solidified + voxel-remeshed watertight solid, in mm
                      └─ model.blend  both meshes with a vertex-colour material
@@ -101,6 +101,16 @@ piece, with relaxed thresholds so fast turns break it less often (248 of 324 dro
 Where the kept model still loses stretches of a video, usually fast turns, the run samples those moments again at 4×
 the frame rate and maps once more, keeping the result only if it's better. On the drone flight this placed 280 of the
 324 original frames (plus extras), with 128k sparse points instead of 82k. The run report warns about any breaks left.
+
+### Flat walls and floors
+
+Plain walls, ceilings, floors and cabinet fronts have little texture, so dense stereo measures their depth noisily
+and the mesh comes out bumpy. Decimation then spends triangles keeping the bumps. With **Flatten walls and floors**
+(on by default for interiors), Blender finds large planes on a sample of the mesh (normals from local PCA, then
+RANSAC), keeps only connected patches of each so a plane can't reach across the room, and moves nearby vertices onto
+it. Vertices between two patches go onto their intersection line, so corners stay sharp. Decimation then needs only a
+few triangles for each flat surface and spends the rest on real detail. Cluttered areas such as full bookshelves
+aren't planar and are left alone. It's off for exteriors, where roofs, terrain and plants would be distorted.
 
 ## Capture tips
 

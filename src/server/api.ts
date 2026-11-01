@@ -145,6 +145,7 @@ function parseSettings(kind: ProjectKind, body: Partial<JobSettings> = {}): JobS
     printFaces: Math.round(
       clamp(body.printFaces, MIN_TARGET_FACES, MAX_TARGET_FACES, d.printFaces ?? d.targetFaces),
     ),
+    flatten: typeof body.flatten === 'boolean' ? body.flatten : d.flatten,
   };
 }
 

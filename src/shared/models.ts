@@ -67,6 +67,8 @@ export interface JobSettings {
   targetFaces: number;
   /** Triangle cap for the printable model.stl. Runs from before it existed used `targetFaces`. */
   printFaces?: number;
+  /** Press large flat areas (walls, floors, ceilings, cabinet fronts) truly flat before decimating. */
+  flatten?: boolean;
 }
 
 /** `targetFaces` value meaning "don't decimate the 3D view". */
@@ -160,6 +162,9 @@ export interface JobStats {
   densePoints?: number;
   meshFaces?: number;
   printableFaces?: number;
+  /** Planes found and the share of vertices moved onto them when flattening. */
+  flatPlanes?: number;
+  flatShare?: number;
   dimensionsMm?: [number, number, number];
   /** Widest input image in pixels (a 360° view counts at its view size). */
   sourceWidth?: number;
@@ -228,6 +233,8 @@ export const DEFAULT_SETTINGS: Record<ProjectKind, Required<JobSettings>> = {
     printSizeMm: 250,
     targetFaces: 500_000,
     printFaces: 1_000_000,
+    // Roofs, terrain and plants aren't planes; flattening is opt-in outside.
+    flatten: false,
   },
   interior: {
     quality: 'medium',
@@ -236,6 +243,7 @@ export const DEFAULT_SETTINGS: Record<ProjectKind, Required<JobSettings>> = {
     printSizeMm: 250,
     targetFaces: 1_000_000,
     printFaces: 1_000_000,
+    flatten: true,
   },
 };
 
