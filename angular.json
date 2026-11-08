@@ -65,7 +65,7 @@
             "server": "src/main.server.ts",
             "outputMode": "server",
             "security": {
-              "allowedHosts": ["localhost", "127.0.0.1"]
+              "allowedHosts": ["localhost", "127.0.0.1", "10.0.1.151"]
             },
             "ssr": {
               "entry": "src/server.ts"
@@ -100,6 +100,10 @@
         },
         "serve": {
           "builder": "@angular/build:dev-server",
+          "options": {
+            "host": "0.0.0.0",
+            "allowedHosts": ["localhost", "127.0.0.1", "10.0.1.151"]
+          },
           "configurations": {
             "production": {
               "buildTarget": "space.fluin.io:build:production"
